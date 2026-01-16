@@ -1,0 +1,6 @@
+flask
+instagrapi
+feedparser
+requests
+beautifulsoup4
+pillow

@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  igbot:
+    build: .
+    container_name: igbot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - igbot_data:/data
+    environment:
+      CHECK_INTERVAL: "60"
+      DEFAULT_RSS: "https://www.montagneepaesi.com/feed/"
+      HUB_LINK: "www.montagneepaesi.com/instagram"
+      WA_CHANNEL_URL: "https://whatsapp.com/channel/0029Vb7fcHT8aKvFAuCIfm0c"
+
+volumes:
+  igbot_data:

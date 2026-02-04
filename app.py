@@ -42,8 +42,8 @@ def log(msg: str):
     line = f"[{ts}] {msg}"
     with logs_lock:
         logs.append(line)
-        if len(logs) > 400:
-            logs[:] = logs[-400:]
+        if len(logs) > 600:
+            logs[:] = logs[-600:]
 
 
 # =============================== METRICS (HA) ================================
@@ -99,7 +99,8 @@ def load_config():
         "rss_url": DEFAULT_RSS,
         "username": "",
         "password": "",
-        "sessionid": ""  # opzionale: cookie web
+        "sessionid": "",
+        "sessionid_only_test": True,  # IMPORTANT: sessionid non viene usato per postare
     }
     cfg = _read_json(CONFIG_PATH, {})
     if isinstance(cfg, dict):
@@ -196,9 +197,6 @@ def get_featured_image_url(article_url: str) -> str:
     return ""
 
 def get_article_excerpt(article_url: str, max_chars: int = 900) -> str:
-    """
-    Estrae testo reale dall'articolo (WP), rimuovendo SOLO il box promo WhatsApp/Telegram.
-    """
     try:
         r = requests.get(article_url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
@@ -287,17 +285,14 @@ def is_csrf_error(e: Exception) -> bool:
 
 class InstagramPoster:
     """
-    Strategia:
-    1) Prova ig_settings.json (sessione instagrapi persistente) -> più stabile
-    2) Se in GUI c'è sessionid: prova login_by_sessionid (cookie web) (NON sempre regge upload)
-    3) Fallback: username/password con device stabile
-    4) Se upload dà CSRF: reset ig_settings + relogin user/pass e riprova 1 volta
+    IMPORTANT:
+    - Per POSTARE usiamo SOLO sessione instagrapi (settings) o user/pass con device stabile.
+    - Il sessionid web (Firefox) lo teniamo solo per test: spesso "sembra" ok ma poi upload fallisce.
     """
     def __init__(self):
         self.cl = Client()
         self.logged_in = False
 
-        # UA "mobile"
         try:
             self.cl.set_user_agent(
                 "Instagram 300.0.0.0.0 Android (30/11; 420dpi; 1080x1920; OnePlus; ONEPLUS A6013; OnePlus6T; qcom; en_US)"
@@ -305,7 +300,7 @@ class InstagramPoster:
         except Exception:
             pass
 
-        # Device stabile (fondamentale in container)
+        # Device stabile
         seed = load_device_seed()
         dev = seed.get("device_settings")
         if isinstance(dev, dict) and dev:
@@ -314,7 +309,6 @@ class InstagramPoster:
             except Exception:
                 pass
         else:
-            # Crea device_settings una sola volta
             try:
                 self.cl.set_device(
                     {
@@ -354,59 +348,35 @@ class InstagramPoster:
             self.logged_in = False
             return False
 
-    def login_with_sessionid(self, sessionid: str) -> bool:
-        sid = (sessionid or "").strip()
-        if not sid:
-            return False
-        try:
-            self.cl.login_by_sessionid(sid)
-            # tenta un warmup
-            try:
-                self.cl.get_timeline_feed()
-            except Exception:
-                pass
-            self.logged_in = True
-            # salviamo settings: a volte torna utile, a volte no
-            try:
-                save_ig_settings(self.cl.get_settings())
-            except Exception:
-                pass
-            log("✅ Login via sessionid completato (cookie web).")
-            return True
-        except Exception as e:
-            log(f"⚠️ Login via sessionid fallito: {e}")
-            self.logged_in = False
-            return False
-
     def login_with_userpass(self, username: str, password: str):
         if not username or not password:
             raise LoginRequired("Username/password mancanti.")
-        # relogin=True rigenera cookies coerenti per device
-        self.cl.login(username, password, relogin=True)
+
+        # relogin=False spesso è più stabile (relogin=True può far scattare CSRF/challenge)
+        self.cl.login(username, password, relogin=False)
         self.logged_in = True
+
         try:
             save_ig_settings(self.cl.get_settings())
         except Exception:
             pass
+
         # warmup
         try:
             self.cl.get_timeline_feed()
         except Exception:
             pass
-        log("✅ Login con username/password completato e sessione salvata.")
 
-    def login(self, username: str, password: str, sessionid: str = ""):
-        log("🔐 Login Instagram in corso...")
+        log("✅ Login con username/password completato e sessione salvata (ig_settings).")
+
+    def login_for_posting(self, username: str, password: str):
+        log("🔐 Login Instagram (posting) in corso...")
 
         # 1) prova sessione instagrapi salvata
         if self.try_restore_settings_session():
             return
 
-        # 2) prova sessionid (se presente)
-        if sessionid and self.login_with_sessionid(sessionid):
-            return
-
-        # 3) fallback user/pass
+        # 2) fallback user/pass
         self.login_with_userpass(username, password)
 
     def ensure_login(self):
@@ -421,27 +391,43 @@ class InstagramPoster:
         except Exception:
             pass
 
+    # ---- SOLO TEST: sessionid web ----
+    @staticmethod
+    def test_sessionid(sessionid: str) -> dict:
+        sid = (sessionid or "").strip()
+        if not sid:
+            return {"ok": False, "error": "sessionid vuoto"}
+
+        cl = Client()
+        try:
+            cl.login_by_sessionid(sid)
+            # prova chiamata leggera
+            me = cl.account_info()
+            return {"ok": True, "username": getattr(me, "username", "") or "", "note": "sessionid valido per web-flow (non garantisce upload)"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
 
 # =============================== BOT LOOP =====================================
-def bot_loop(username: str, password: str, rss_url: str, sessionid: str):
+def bot_loop(username: str, password: str, rss_url: str):
     poster = InstagramPoster()
     set_metric("running", True)
     set_metric("last_error", "")
 
     try:
-        poster.login(username, password, sessionid=sessionid)
+        poster.login_for_posting(username, password)
     except TwoFactorRequired:
-        log("❌ Instagram richiede 2FA.")
+        log("❌ Instagram richiede 2FA: con instagrapi in container spesso non è gestibile. Login dall'app e riprova.")
         set_metric("last_error", "2FA required")
         set_metric("running", False)
         return
     except ChallengeRequired:
-        log("❌ Instagram ha richiesto una Challenge (verifica).")
+        log("❌ Instagram richiede Challenge. Apri Instagram su telefono, conferma sicurezza, poi riavvia container.")
         set_metric("last_error", "Challenge required")
         set_metric("running", False)
         return
     except Exception as e:
-        log(f"❌ Errore login: {e}")
+        log(f"❌ Errore login (posting): {e}")
         set_metric("last_error", str(e))
         set_metric("running", False)
         return
@@ -500,16 +486,15 @@ def bot_loop(username: str, password: str, rss_url: str, sessionid: str):
             log(f"📸 Pubblico: {title}")
             log("📤 Carico il post su Instagram...")
 
-            # Tentativo upload
             try:
                 poster.post_photo(LATEST_IMG_PATH, caption)
             except Exception as e:
-                # Se CSRF durante upload: reset + relogin user/pass + retry una sola volta
-                if is_csrf_error(e):
-                    log("⚠️ CSRF durante upload: resetto sessione instagrapi e riprovo 1 volta con user/pass...")
+                # Retry una volta su CSRF/login_required: reset settings e riloggati user/pass
+                if is_csrf_error(e) or ("login_required" in str(e).lower()):
+                    log("⚠️ Errore durante upload (CSRF/login_required): resetto sessione instagrapi e riprovo 1 volta...")
                     delete_ig_settings()
                     poster = InstagramPoster()
-                    poster.login_with_userpass(username, password)
+                    poster.login_for_posting(username, password)
                     poster.post_photo(LATEST_IMG_PATH, caption)
                 else:
                     raise
@@ -554,12 +539,14 @@ PAGE = """
     .start{background:#111;color:#fff}
     .stop{background:#fff;border:1px solid #111;color:#111}
     .muted{color:#666;font-size:14px}
-    pre{background:#0b0b0b;color:#d6d6d6;padding:12px;border-radius:14px;overflow:auto;max-height:480px}
+    pre{background:#0b0b0b;color:#d6d6d6;padding:12px;border-radius:14px;overflow:auto;max-height:520px}
     a{color:#111}
     .pill{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid #ddd;font-weight:800;font-size:13px}
     .hint{color:#666;font-size:13px;margin-top:6px}
     .warn{color:#a30000;font-weight:800}
     .small{font-size:12px;color:#777;margin-top:6px}
+    .chk{display:flex;align-items:center;gap:10px;margin-top:10px}
+    .chk input{width:auto}
   </style>
 </head>
 <body>
@@ -573,19 +560,29 @@ PAGE = """
     </div>
 
     <div class="hint">
-      <span class="warn">Attenzione:</span> il <b>sessionid</b> è sensibile come una password.
-      Se presente, il bot prova: (1) sessione salvata, (2) sessionid, (3) username/password.
-      Se durante l'upload compare CSRF, riprova automaticamente 1 volta con username/password.
+      <span class="warn">Nota importante:</span> il <b>sessionid</b> di Firefox è un cookie <b>web</b>.
+      Può risultare “valido” ma <b>non</b> garantisce l'upload (spesso porta a <code>login_required</code>).
+      Questo bot pubblica usando <b>solo</b> username/password + sessione instagrapi persistente.
+      Il sessionid resta qui solo per test.
     </div>
 
     <form method="post" action="/save">
-      <label>Instagram sessionid (opzionale)</label>
+      <label>Instagram sessionid (solo test)</label>
       <input name="sessionid" value="{{sessionid}}" placeholder="es. 123%3AABC..."/>
 
-      <label>Instagram username (fallback)</label>
+      <div class="chk">
+        <input id="sessionid_only_test" type="checkbox" name="sessionid_only_test" value="1" {{ 'checked' if sessionid_only_test else '' }}/>
+        <label for="sessionid_only_test" style="margin:0;font-weight:700;">Usa sessionid solo per test (consigliato)</label>
+      </div>
+
+      <div class="row">
+        <button class="btn stop" formaction="/test_sessionid" formmethod="post">Test sessionid</button>
+      </div>
+
+      <label>Instagram username (necessario per pubblicare)</label>
       <input name="username" value="{{username}}" placeholder="username"/>
 
-      <label>Instagram password (fallback)</label>
+      <label>Instagram password (necessaria per pubblicare)</label>
       <input name="password" value="{{password}}" type="password" placeholder="password"/>
 
       <label>RSS Feed URL</label>
@@ -637,6 +634,7 @@ def index():
     return render_template_string(
         PAGE,
         sessionid=cfg.get("sessionid",""),
+        sessionid_only_test=bool(cfg.get("sessionid_only_test", True)),
         username=cfg.get("username",""),
         password=cfg.get("password",""),
         rss_url=cfg.get("rss_url", DEFAULT_RSS),
@@ -649,6 +647,7 @@ def index():
 def save():
     cfg = load_config()
     cfg["sessionid"] = request.form.get("sessionid","").strip()
+    cfg["sessionid_only_test"] = bool(request.form.get("sessionid_only_test"))
     cfg["username"] = request.form.get("username","").strip()
     cfg["password"] = request.form.get("password","").strip()
     cfg["rss_url"] = request.form.get("rss_url","").strip() or DEFAULT_RSS
@@ -656,22 +655,34 @@ def save():
     log("💾 Config salvata.")
     return redirect("/")
 
+@app.post("/test_sessionid")
+def test_sessionid():
+    cfg = load_config()
+    sessionid = request.form.get("sessionid","").strip() or cfg.get("sessionid","").strip()
+    if not sessionid:
+        log("❌ Test sessionid: vuoto.")
+        return redirect("/")
+
+    res = InstagramPoster.test_sessionid(sessionid)
+    if res.get("ok"):
+        log(f"✅ Test sessionid OK. Username: {res.get('username','')}. Nota: {res.get('note','')}")
+    else:
+        log(f"❌ Test sessionid fallito: {res.get('error','')}")
+    return redirect("/")
+
 @app.post("/start")
 def start():
     global bot_thread
     cfg = load_config()
 
-    sessionid = (request.form.get("sessionid","").strip() or cfg.get("sessionid","").strip())
-    username  = (request.form.get("username","").strip()  or cfg.get("username","").strip())
-    password  = (request.form.get("password","").strip()  or cfg.get("password","").strip())
-    rss_url   = (request.form.get("rss_url","").strip()   or cfg.get("rss_url", DEFAULT_RSS))
+    username = (request.form.get("username","").strip() or cfg.get("username","").strip())
+    password = (request.form.get("password","").strip() or cfg.get("password","").strip())
+    rss_url  = (request.form.get("rss_url","").strip() or cfg.get("rss_url", DEFAULT_RSS))
 
-    # serve almeno user+pass (perché se sessionid fallisce l'upload, facciamo retry con user+pass)
     if not username or not password:
-        log("❌ Inserisci username e password (servono come fallback).")
+        log("❌ Inserisci username e password (servono per pubblicare).")
         return redirect("/")
 
-    cfg["sessionid"] = sessionid
     cfg["username"] = username
     cfg["password"] = password
     cfg["rss_url"] = rss_url
@@ -686,7 +697,7 @@ def start():
         stop_event.clear()
         bot_thread = threading.Thread(
             target=bot_loop,
-            args=(username, password, rss_url, sessionid),
+            args=(username, password, rss_url),
             daemon=True
         )
         bot_thread.start()
@@ -708,7 +719,7 @@ def status():
 @app.get("/logs")
 def get_logs():
     with logs_lock:
-        return jsonify({"lines": logs[-400:]})
+        return jsonify({"lines": logs[-600:]})
 
 @app.get("/metrics")
 def metrics_endpoint():

@@ -22,6 +22,7 @@ IG_SETTINGS_PATH = os.environ.get("IG_SETTINGS_PATH", "/data/ig_settings.json")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 DEFAULT_RSS = os.environ.get("DEFAULT_RSS", "https://www.montagneepaesi.com/feed/")
 HUB_LINK = os.environ.get("HUB_LINK", "www.montagneepaesi.com/instagram")
+
 WA_CHANNEL_URL = os.environ.get(
     "WA_CHANNEL_URL",
     "https://whatsapp.com/channel/0029Vb7fcHT8aKvFAuCIfm0c"
@@ -98,7 +99,7 @@ def save_last_posted_url(url: str):
         f.write(url.strip())
 
 
-# ---------------- Persistenza sessione Instagram (evita checkpoint) ----------------
+# ---------------- Persistenza sessione Instagram ----------------
 def load_ig_settings():
     if os.path.exists(IG_SETTINGS_PATH):
         try:
@@ -113,6 +114,13 @@ def save_ig_settings(settings: dict):
         _ensure_parent(IG_SETTINGS_PATH)
         with open(IG_SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(settings, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def delete_ig_settings():
+    try:
+        if os.path.exists(IG_SETTINGS_PATH):
+            os.remove(IG_SETTINGS_PATH)
     except Exception:
         pass
 
@@ -191,7 +199,6 @@ def get_article_excerpt(article_url: str, max_chars: int = 900) -> str:
         promo_phrase = "vuoi ricevere le notizie di montagne"
         wa_marker = "whatsapp.com/channel/0029vb7fcht8akvfaucifm0c"
 
-        # rimuovi wrapper promo
         for node in content.find_all(["div", "section", "aside"]):
             txt = node.get_text(" ", strip=True).lower()
             html = str(node).lower().replace(" ", "")
@@ -260,8 +267,6 @@ class InstagramPoster:
     def __init__(self):
         self.cl = Client()
         self.logged_in = False
-
-        # usa un user-agent “realistico”
         try:
             self.cl.set_user_agent(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
@@ -275,28 +280,27 @@ class InstagramPoster:
             return False
         try:
             self.cl.set_settings(s)
-
-            # chiamata leggera per validare sessione
-            self.cl.get_timeline_feed()
+            self.cl.get_timeline_feed()  # valida sessione
             self.logged_in = True
             log("♻️ Sessione Instagram ripristinata (no login).")
             return True
-        except Exception:
+        except Exception as e:
+            log(f"⚠️ Sessione salvata non valida, la resetto: {e}")
+            delete_ig_settings()
             self.logged_in = False
             return False
 
     def login(self, username: str, password: str):
         log("🔐 Login Instagram in corso...")
 
-        # prima prova a ripristinare sessione salvata
+        # prova sessione salvata
         if self.try_restore_session():
             return
 
-        # login classico
-        self.cl.login(username, password)
+        # login pulito (relogin forza nuova sessione)
+        self.cl.login(username, password, relogin=True)
         self.logged_in = True
 
-        # salva settings per riuso futuro
         try:
             save_ig_settings(self.cl.get_settings())
         except Exception:
@@ -313,8 +317,6 @@ class InstagramPoster:
         log("📤 Carico il post su Instagram...")
         self.cl.photo_upload(image_path, caption)
         log("✅ Pubblicato su Instagram.")
-
-        # dopo upload, aggiorna settings (cookie/sessione può cambiare)
         try:
             save_ig_settings(self.cl.get_settings())
         except Exception:

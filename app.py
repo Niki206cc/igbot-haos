@@ -14,10 +14,11 @@ from instagrapi import Client
 from instagrapi.exceptions import LoginRequired, ChallengeRequired, TwoFactorRequired
 
 
-# ---------------- Config / Paths (persistenti su volume /data) ----------------
+# =============================== CONFIG / PATHS ===============================
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/data/config.json")
 LAST_POST_PATH = os.environ.get("LAST_POST_PATH", "/data/last_post.txt")
 IG_SETTINGS_PATH = os.environ.get("IG_SETTINGS_PATH", "/data/ig_settings.json")
+DEVICE_SEED_PATH = os.environ.get("DEVICE_SEED_PATH", "/data/device_seed.json")
 
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 DEFAULT_RSS = os.environ.get("DEFAULT_RSS", "https://www.montagneepaesi.com/feed/")
@@ -28,7 +29,11 @@ WA_CHANNEL_URL = os.environ.get(
     "https://whatsapp.com/channel/0029Vb7fcHT8aKvFAuCIfm0c"
 )
 
-# ---------------- Log in memoria ----------------
+IMAGES_DIR = os.environ.get("IMAGES_DIR", "/data/images")
+LATEST_IMG_PATH = os.path.join(IMAGES_DIR, "latest.jpg")
+
+
+# =============================== LOGS (in-memory) =============================
 logs = []
 logs_lock = threading.Lock()
 
@@ -41,7 +46,7 @@ def log(msg: str):
             logs[:] = logs[-400:]
 
 
-# ---------------- Metriche (per dashboard HA) ----------------
+# =============================== METRICS (HA) ================================
 metrics = {
     "running": False,
     "last_title": "",
@@ -61,42 +66,56 @@ def inc_posts_count():
         metrics["posts_count"] = int(metrics.get("posts_count", 0)) + 1
 
 
-# ---------------- Thread state ----------------
+# =============================== THREAD STATE ================================
 bot_thread = None
 bot_lock = threading.Lock()
 stop_event = threading.Event()
 
 
-# ---------------- Persistenza config / last post ----------------
+# =============================== UTILS =======================================
 def _ensure_parent(path: str):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-def load_config():
-    """
-    Config salvata su /data/config.json
-    """
-    base = {"rss_url": DEFAULT_RSS, "username": "", "password": "", "sessionid": ""}
-    if os.path.exists(CONFIG_PATH):
+def _read_json(path: str, default):
+    if os.path.exists(path):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f) or {}
-            base.update(cfg)
-            return base
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
-            return base
+            return default
+    return default
+
+def _write_json(path: str, data):
+    _ensure_parent(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# =============================== PERSISTENCE =================================
+def load_config():
+    base = {
+        "rss_url": DEFAULT_RSS,
+        "username": "",
+        "password": "",
+        "sessionid": ""  # opzionale: cookie web
+    }
+    cfg = _read_json(CONFIG_PATH, {})
+    if isinstance(cfg, dict):
+        base.update(cfg)
     return base
 
 def save_config(cfg):
-    _ensure_parent(CONFIG_PATH)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _write_json(CONFIG_PATH, cfg)
 
 def get_last_posted_url():
     if os.path.exists(LAST_POST_PATH):
-        with open(LAST_POST_PATH, "r", encoding="utf-8") as f:
-            return f.read().strip()
+        try:
+            with open(LAST_POST_PATH, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
     return ""
 
 def save_last_posted_url(url: str):
@@ -104,22 +123,12 @@ def save_last_posted_url(url: str):
     with open(LAST_POST_PATH, "w", encoding="utf-8") as f:
         f.write(url.strip())
 
-
-# ---------------- Persistenza sessione Instagram (instagrapi settings) ----------------
 def load_ig_settings():
-    if os.path.exists(IG_SETTINGS_PATH):
-        try:
-            with open(IG_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
+    return _read_json(IG_SETTINGS_PATH, None)
 
 def save_ig_settings(settings: dict):
     try:
-        _ensure_parent(IG_SETTINGS_PATH)
-        with open(IG_SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False)
+        _write_json(IG_SETTINGS_PATH, settings)
     except Exception:
         pass
 
@@ -130,8 +139,14 @@ def delete_ig_settings():
     except Exception:
         pass
 
+def load_device_seed():
+    return _read_json(DEVICE_SEED_PATH, {})
 
-# ---------------- Utility testo ----------------
+def save_device_seed(seed: dict):
+    _write_json(DEVICE_SEED_PATH, seed)
+
+
+# =============================== TEXT HELPERS =================================
 def clean_text(s: str) -> str:
     if not s:
         return ""
@@ -161,7 +176,7 @@ def hashtags_from_title(title: str, max_tags=8) -> str:
     return " ".join(fixed + tags[:max_tags])
 
 
-# ---------------- RSS + estrazione contenuti ----------------
+# =============================== RSS / CONTENT =================================
 def get_latest_entry(rss_url: str):
     feed = feedparser.parse(rss_url)
     if not feed.entries:
@@ -236,9 +251,6 @@ def get_article_excerpt(article_url: str, max_chars: int = 900) -> str:
         return ""
 
 def get_excerpt_from_feed_entry(entry, max_chars: int = 900) -> str:
-    """
-    Fallback: prende testo dal feed (content/summary).
-    """
     try:
         txt = ""
         if hasattr(entry, "content") and entry.content:
@@ -268,34 +280,71 @@ def download_image(url: str, out_path: str) -> bool:
         return False
 
 
-# ---------------- Instagram (instagrapi) ----------------
+# =============================== INSTAGRAM (instagrapi) =======================
+def is_csrf_error(e: Exception) -> bool:
+    s = str(e)
+    return ("CSRF token missing or incorrect" in s) or ('"CSRF token missing or incorrect"' in s)
+
 class InstagramPoster:
+    """
+    Strategia:
+    1) Prova ig_settings.json (sessione instagrapi persistente) -> più stabile
+    2) Se in GUI c'è sessionid: prova login_by_sessionid (cookie web) (NON sempre regge upload)
+    3) Fallback: username/password con device stabile
+    4) Se upload dà CSRF: reset ig_settings + relogin user/pass e riprova 1 volta
+    """
     def __init__(self):
         self.cl = Client()
         self.logged_in = False
+
+        # UA "mobile"
         try:
             self.cl.set_user_agent(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+                "Instagram 300.0.0.0.0 Android (30/11; 420dpi; 1080x1920; OnePlus; ONEPLUS A6013; OnePlus6T; qcom; en_US)"
             )
         except Exception:
             pass
 
-        # migliora consistenza in container (non obbligatorio, ma aiuta)
-        try:
-            self.cl.set_locale("it_IT")
-            self.cl.set_country_code(39)
-            # offset Italia in inverno = 3600; in estate = 7200
-            self.cl.set_timezone_offset(3600)
-        except Exception:
-            pass
+        # Device stabile (fondamentale in container)
+        seed = load_device_seed()
+        dev = seed.get("device_settings")
+        if isinstance(dev, dict) and dev:
+            try:
+                self.cl.set_settings({"device_settings": dev})
+            except Exception:
+                pass
+        else:
+            # Crea device_settings una sola volta
+            try:
+                self.cl.set_device(
+                    {
+                        "app_version": "300.0.0.0.0",
+                        "android_version": 30,
+                        "android_release": "11",
+                        "dpi": "420dpi",
+                        "resolution": "1080x1920",
+                        "manufacturer": "OnePlus",
+                        "device": "OnePlus6T",
+                        "model": "ONEPLUS A6013",
+                        "cpu": "qcom",
+                        "version_code": "55912345",
+                    }
+                )
+                current = self.cl.get_settings() or {}
+                ds = current.get("device_settings", {})
+                if ds:
+                    seed["device_settings"] = ds
+                    save_device_seed(seed)
+            except Exception:
+                pass
 
-    def try_restore_session(self) -> bool:
+    def try_restore_settings_session(self) -> bool:
         s = load_ig_settings()
         if not s:
             return False
         try:
             self.cl.set_settings(s)
-            self.cl.get_timeline_feed()  # valida sessione
+            self.cl.get_timeline_feed()
             self.logged_in = True
             log("♻️ Sessione Instagram ripristinata (ig_settings.json).")
             return True
@@ -305,42 +354,60 @@ class InstagramPoster:
             self.logged_in = False
             return False
 
-    def login(self, username: str, password: str, sessionid: str = ""):
-        log("🔐 Login Instagram in corso...")
-
-        # 1) priorità: sessionid inserito in GUI o in ENV
-        sid = (sessionid or "").strip() or os.environ.get("IG_SESSIONID", "").strip()
-        if sid:
+    def login_with_sessionid(self, sessionid: str) -> bool:
+        sid = (sessionid or "").strip()
+        if not sid:
+            return False
+        try:
+            self.cl.login_by_sessionid(sid)
+            # tenta un warmup
             try:
-                self.cl.login_by_sessionid(sid)
-                self.logged_in = True
-                try:
-                    save_ig_settings(self.cl.get_settings())
-                except Exception:
-                    pass
-                log("✅ Login via sessionid completato e sessione salvata.")
-                return
-            except Exception as e:
-                # se fallisce, lo segnalo e ripiego
-                log(f"⚠️ Login via sessionid fallito: {e} (ripiego su sessione salvata / user+pass)")
+                self.cl.get_timeline_feed()
+            except Exception:
+                pass
+            self.logged_in = True
+            # salviamo settings: a volte torna utile, a volte no
+            try:
+                save_ig_settings(self.cl.get_settings())
+            except Exception:
+                pass
+            log("✅ Login via sessionid completato (cookie web).")
+            return True
+        except Exception as e:
+            log(f"⚠️ Login via sessionid fallito: {e}")
+            self.logged_in = False
+            return False
 
-        # 2) prova sessione salvata (ig_settings.json)
-        if self.try_restore_session():
-            return
-
-        # 3) login classico (senza relogin forzato)
+    def login_with_userpass(self, username: str, password: str):
         if not username or not password:
-            raise LoginRequired("Username/password mancanti e sessionid non valido.")
-
-        self.cl.login(username, password, relogin=False)
+            raise LoginRequired("Username/password mancanti.")
+        # relogin=True rigenera cookies coerenti per device
+        self.cl.login(username, password, relogin=True)
         self.logged_in = True
-
         try:
             save_ig_settings(self.cl.get_settings())
         except Exception:
             pass
-
+        # warmup
+        try:
+            self.cl.get_timeline_feed()
+        except Exception:
+            pass
         log("✅ Login con username/password completato e sessione salvata.")
+
+    def login(self, username: str, password: str, sessionid: str = ""):
+        log("🔐 Login Instagram in corso...")
+
+        # 1) prova sessione instagrapi salvata
+        if self.try_restore_settings_session():
+            return
+
+        # 2) prova sessionid (se presente)
+        if sessionid and self.login_with_sessionid(sessionid):
+            return
+
+        # 3) fallback user/pass
+        self.login_with_userpass(username, password)
 
     def ensure_login(self):
         if not self.logged_in:
@@ -348,16 +415,14 @@ class InstagramPoster:
 
     def post_photo(self, image_path: str, caption: str):
         self.ensure_login()
-        log("📤 Carico il post su Instagram...")
         self.cl.photo_upload(image_path, caption)
-        log("✅ Pubblicato su Instagram.")
         try:
             save_ig_settings(self.cl.get_settings())
         except Exception:
             pass
 
 
-# ---------------- Bot loop ----------------
+# =============================== BOT LOOP =====================================
 def bot_loop(username: str, password: str, rss_url: str, sessionid: str):
     poster = InstagramPoster()
     set_metric("running", True)
@@ -381,7 +446,7 @@ def bot_loop(username: str, password: str, rss_url: str, sessionid: str):
         set_metric("running", False)
         return
 
-    os.makedirs("/data/images", exist_ok=True)
+    os.makedirs(IMAGES_DIR, exist_ok=True)
 
     while not stop_event.is_set():
         try:
@@ -427,17 +492,31 @@ def bot_loop(username: str, password: str, rss_url: str, sessionid: str):
 👉 {HUB_LINK}"""
             caption = clamp_caption(caption, 2200)
 
-            img_path = "/data/images/latest.jpg"
-            if not download_image(img_url, img_path):
+            if not download_image(img_url, LATEST_IMG_PATH):
                 log("❌ Download immagine fallito.")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
             log(f"📸 Pubblico: {title}")
-            poster.post_photo(img_path, caption)
+            log("📤 Carico il post su Instagram...")
+
+            # Tentativo upload
+            try:
+                poster.post_photo(LATEST_IMG_PATH, caption)
+            except Exception as e:
+                # Se CSRF durante upload: reset + relogin user/pass + retry una sola volta
+                if is_csrf_error(e):
+                    log("⚠️ CSRF durante upload: resetto sessione instagrapi e riprovo 1 volta con user/pass...")
+                    delete_ig_settings()
+                    poster = InstagramPoster()
+                    poster.login_with_userpass(username, password)
+                    poster.post_photo(LATEST_IMG_PATH, caption)
+                else:
+                    raise
+
+            log("✅ Pubblicato su Instagram.")
             save_last_posted_url(link)
 
-            # metriche ok
             set_metric("last_title", title)
             set_metric("last_link", link)
             set_metric("last_published_at", datetime.now().isoformat())
@@ -454,7 +533,7 @@ def bot_loop(username: str, password: str, rss_url: str, sessionid: str):
     set_metric("running", False)
 
 
-# ---------------- Web UI (Flask) ----------------
+# =============================== WEB UI (Flask) ===============================
 app = Flask(__name__)
 
 PAGE = """
@@ -480,6 +559,7 @@ PAGE = """
     .pill{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid #ddd;font-weight:800;font-size:13px}
     .hint{color:#666;font-size:13px;margin-top:6px}
     .warn{color:#a30000;font-weight:800}
+    .small{font-size:12px;color:#777;margin-top:6px}
   </style>
 </head>
 <body>
@@ -493,12 +573,13 @@ PAGE = """
     </div>
 
     <div class="hint">
-      <span class="warn">Nota:</span> il <b>sessionid</b> è sensibile (come una password). Se lo cambi su Instagram, aggiornalo qui.
-      Se presente, il bot prova prima con sessionid, poi con sessione salvata, poi con username/password.
+      <span class="warn">Attenzione:</span> il <b>sessionid</b> è sensibile come una password.
+      Se presente, il bot prova: (1) sessione salvata, (2) sessionid, (3) username/password.
+      Se durante l'upload compare CSRF, riprova automaticamente 1 volta con username/password.
     </div>
 
     <form method="post" action="/save">
-      <label>Instagram sessionid (opzionale ma consigliato)</label>
+      <label>Instagram sessionid (opzionale)</label>
       <input name="sessionid" value="{{sessionid}}" placeholder="es. 123%3AABC..."/>
 
       <label>Instagram username (fallback)</label>
@@ -518,6 +599,9 @@ PAGE = """
 
       <div class="muted" style="margin-top:10px;">
         Hub link: <b>{{hub}}</b> • Canale WhatsApp: <a href="{{wa}}" target="_blank" rel="noopener">apri</a>
+      </div>
+      <div class="small">
+        File persistenti: config.json, ig_settings.json, device_seed.json, last_post.txt in /data.
       </div>
     </form>
   </div>
@@ -582,9 +666,9 @@ def start():
     password  = (request.form.get("password","").strip()  or cfg.get("password","").strip())
     rss_url   = (request.form.get("rss_url","").strip()   or cfg.get("rss_url", DEFAULT_RSS))
 
-    # Regola: se non hai sessionid, devi avere user+pass
-    if not sessionid and (not username or not password):
-        log("❌ Inserisci sessionid oppure username+password.")
+    # serve almeno user+pass (perché se sessionid fallisce l'upload, facciamo retry con user+pass)
+    if not username or not password:
+        log("❌ Inserisci username e password (servono come fallback).")
         return redirect("/")
 
     cfg["sessionid"] = sessionid

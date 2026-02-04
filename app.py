@@ -74,13 +74,19 @@ def _ensure_parent(path: str):
         os.makedirs(parent, exist_ok=True)
 
 def load_config():
+    """
+    Config salvata su /data/config.json
+    """
+    base = {"rss_url": DEFAULT_RSS, "username": "", "password": "", "sessionid": ""}
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f) or {}
+            base.update(cfg)
+            return base
         except Exception:
-            return {"rss_url": DEFAULT_RSS, "username": "", "password": ""}
-    return {"rss_url": DEFAULT_RSS, "username": "", "password": ""}
+            return base
+    return base
 
 def save_config(cfg):
     _ensure_parent(CONFIG_PATH)
@@ -99,7 +105,7 @@ def save_last_posted_url(url: str):
         f.write(url.strip())
 
 
-# ---------------- Persistenza sessione Instagram ----------------
+# ---------------- Persistenza sessione Instagram (instagrapi settings) ----------------
 def load_ig_settings():
     if os.path.exists(IG_SETTINGS_PATH):
         try:
@@ -274,6 +280,15 @@ class InstagramPoster:
         except Exception:
             pass
 
+        # migliora consistenza in container (non obbligatorio, ma aiuta)
+        try:
+            self.cl.set_locale("it_IT")
+            self.cl.set_country_code(39)
+            # offset Italia in inverno = 3600; in estate = 7200
+            self.cl.set_timezone_offset(3600)
+        except Exception:
+            pass
+
     def try_restore_session(self) -> bool:
         s = load_ig_settings()
         if not s:
@@ -282,7 +297,7 @@ class InstagramPoster:
             self.cl.set_settings(s)
             self.cl.get_timeline_feed()  # valida sessione
             self.logged_in = True
-            log("♻️ Sessione Instagram ripristinata (no login).")
+            log("♻️ Sessione Instagram ripristinata (ig_settings.json).")
             return True
         except Exception as e:
             log(f"⚠️ Sessione salvata non valida, la resetto: {e}")
@@ -290,15 +305,34 @@ class InstagramPoster:
             self.logged_in = False
             return False
 
-    def login(self, username: str, password: str):
+    def login(self, username: str, password: str, sessionid: str = ""):
         log("🔐 Login Instagram in corso...")
 
-        # prova sessione salvata
+        # 1) priorità: sessionid inserito in GUI o in ENV
+        sid = (sessionid or "").strip() or os.environ.get("IG_SESSIONID", "").strip()
+        if sid:
+            try:
+                self.cl.login_by_sessionid(sid)
+                self.logged_in = True
+                try:
+                    save_ig_settings(self.cl.get_settings())
+                except Exception:
+                    pass
+                log("✅ Login via sessionid completato e sessione salvata.")
+                return
+            except Exception as e:
+                # se fallisce, lo segnalo e ripiego
+                log(f"⚠️ Login via sessionid fallito: {e} (ripiego su sessione salvata / user+pass)")
+
+        # 2) prova sessione salvata (ig_settings.json)
         if self.try_restore_session():
             return
 
-        # login pulito (relogin forza nuova sessione)
-        self.cl.login(username, password, relogin=True)
+        # 3) login classico (senza relogin forzato)
+        if not username or not password:
+            raise LoginRequired("Username/password mancanti e sessionid non valido.")
+
+        self.cl.login(username, password, relogin=False)
         self.logged_in = True
 
         try:
@@ -306,7 +340,7 @@ class InstagramPoster:
         except Exception:
             pass
 
-        log("✅ Login completato e sessione salvata.")
+        log("✅ Login con username/password completato e sessione salvata.")
 
     def ensure_login(self):
         if not self.logged_in:
@@ -324,13 +358,13 @@ class InstagramPoster:
 
 
 # ---------------- Bot loop ----------------
-def bot_loop(username: str, password: str, rss_url: str):
+def bot_loop(username: str, password: str, rss_url: str, sessionid: str):
     poster = InstagramPoster()
     set_metric("running", True)
     set_metric("last_error", "")
 
     try:
-        poster.login(username, password)
+        poster.login(username, password, sessionid=sessionid)
     except TwoFactorRequired:
         log("❌ Instagram richiede 2FA.")
         set_metric("last_error", "2FA required")
@@ -444,6 +478,8 @@ PAGE = """
     pre{background:#0b0b0b;color:#d6d6d6;padding:12px;border-radius:14px;overflow:auto;max-height:480px}
     a{color:#111}
     .pill{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid #ddd;font-weight:800;font-size:13px}
+    .hint{color:#666;font-size:13px;margin-top:6px}
+    .warn{color:#a30000;font-weight:800}
   </style>
 </head>
 <body>
@@ -456,11 +492,19 @@ PAGE = """
       <span class="pill">/metrics attivo</span>
     </div>
 
+    <div class="hint">
+      <span class="warn">Nota:</span> il <b>sessionid</b> è sensibile (come una password). Se lo cambi su Instagram, aggiornalo qui.
+      Se presente, il bot prova prima con sessionid, poi con sessione salvata, poi con username/password.
+    </div>
+
     <form method="post" action="/save">
-      <label>Instagram username</label>
+      <label>Instagram sessionid (opzionale ma consigliato)</label>
+      <input name="sessionid" value="{{sessionid}}" placeholder="es. 123%3AABC..."/>
+
+      <label>Instagram username (fallback)</label>
       <input name="username" value="{{username}}" placeholder="username"/>
 
-      <label>Instagram password</label>
+      <label>Instagram password (fallback)</label>
       <input name="password" value="{{password}}" type="password" placeholder="password"/>
 
       <label>RSS Feed URL</label>
@@ -508,6 +552,7 @@ def index():
     cfg = load_config()
     return render_template_string(
         PAGE,
+        sessionid=cfg.get("sessionid",""),
         username=cfg.get("username",""),
         password=cfg.get("password",""),
         rss_url=cfg.get("rss_url", DEFAULT_RSS),
@@ -519,6 +564,7 @@ def index():
 @app.post("/save")
 def save():
     cfg = load_config()
+    cfg["sessionid"] = request.form.get("sessionid","").strip()
     cfg["username"] = request.form.get("username","").strip()
     cfg["password"] = request.form.get("password","").strip()
     cfg["rss_url"] = request.form.get("rss_url","").strip() or DEFAULT_RSS
@@ -531,14 +577,17 @@ def start():
     global bot_thread
     cfg = load_config()
 
-    username = (request.form.get("username","").strip() or cfg.get("username","").strip())
-    password = (request.form.get("password","").strip() or cfg.get("password","").strip())
-    rss_url  = (request.form.get("rss_url","").strip() or cfg.get("rss_url", DEFAULT_RSS))
+    sessionid = (request.form.get("sessionid","").strip() or cfg.get("sessionid","").strip())
+    username  = (request.form.get("username","").strip()  or cfg.get("username","").strip())
+    password  = (request.form.get("password","").strip()  or cfg.get("password","").strip())
+    rss_url   = (request.form.get("rss_url","").strip()   or cfg.get("rss_url", DEFAULT_RSS))
 
-    if not username or not password:
-        log("❌ Username/password mancanti.")
+    # Regola: se non hai sessionid, devi avere user+pass
+    if not sessionid and (not username or not password):
+        log("❌ Inserisci sessionid oppure username+password.")
         return redirect("/")
 
+    cfg["sessionid"] = sessionid
     cfg["username"] = username
     cfg["password"] = password
     cfg["rss_url"] = rss_url
@@ -551,7 +600,11 @@ def start():
             return redirect("/")
 
         stop_event.clear()
-        bot_thread = threading.Thread(target=bot_loop, args=(username, password, rss_url), daemon=True)
+        bot_thread = threading.Thread(
+            target=bot_loop,
+            args=(username, password, rss_url, sessionid),
+            daemon=True
+        )
         bot_thread.start()
         log("▶️ Bot avviato.")
         return redirect("/")

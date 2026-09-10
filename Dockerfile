@@ -13,6 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY safe_app.py .
 
 EXPOSE 8080
-CMD ["python", "app.py"]
+CMD ["python", "safe_app.py"]

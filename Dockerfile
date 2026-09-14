@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY safe_app.py .
+COPY waha_patch.py .
 
 EXPOSE 8080
-CMD ["python", "safe_app.py"]
+CMD ["python", "waha_patch.py"]

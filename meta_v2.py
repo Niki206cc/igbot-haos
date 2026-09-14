@@ -1,13 +1,13 @@
-"""Montagne & Paesi Instagram Bot v2.0.2 - official Meta API publishing test."""
+"""Montagne & Paesi Instagram Bot v2.0.3 - official Meta API publishing test."""
 import html, json, os, re
 from datetime import datetime
 import requests, feedparser
 from bs4 import BeautifulSoup
 from flask import Flask, request, redirect, jsonify, render_template_string
-APP_VERSION="2.0.2-test"; CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json"); LAST_POST_PATH=os.environ.get("LAST_POST_PATH","/data/last_post_meta.txt"); GRAPH_BASE=os.environ.get("META_GRAPH_BASE","https://graph.instagram.com"); DEFAULT_IG_USER_ID="17841409303885274"; DEFAULT_RSS="https://www.montagneepaesi.com/feed/"; HUB_LINK="www.montagneepaesi.com"
+APP_VERSION="2.0.3-test"; CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json"); LAST_POST_PATH=os.environ.get("LAST_POST_PATH","/data/last_post_meta.txt"); GRAPH_BASE=os.environ.get("META_GRAPH_BASE","https://graph.instagram.com"); DEFAULT_IG_USER_ID="17841409303885274"; DEFAULT_RSS="https://www.montagneepaesi.com/feed/"; HUB_LINK="www.montagneepaesi.com"
 app=Flask(__name__); logs=[]; state={"meta_connected":False,"username":"","last_error":"","preview":{}}
 def log(m):
- line=f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {m}"; logs.append(line); del logs[:-600]; print(line,flush=True)
+ line=f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {m}";logs.append(line);del logs[:-600];print(line,flush=True)
 def load_config():
  try:
   with open(CONFIG_PATH,"r",encoding="utf-8") as f:x=json.load(f);return x if isinstance(x,dict) else {}
@@ -23,8 +23,19 @@ def api_error(r):
  return d
 def meta_test(t,u):return api_error(requests.get(f"{GRAPH_BASE}/v24.0/{u}",params={"fields":"id,username","access_token":t},timeout=20))
 def clean(s):return re.sub(r"\s+"," ",BeautifulSoup(s or "","html.parser").get_text(" ",strip=True)).strip()
+def is_promo(x):
+ y=x.lower()
+ markers=["ricevi gratis le notizie di montagne & paesi","ricevi gratis le notizie di montagne e paesi","iscriviti al nostro canale whatsapp","clicca qui per iscriverti al canale","seguici anche su telegram","unisciti al canale telegram","clicca qui per iscriverti su telegram"]
+ return any(m in y for m in markers)
+def strip_promos(parts):
+ out=[];skip=False
+ for x in parts:
+  y=x.lower()
+  if "ricevi gratis le notizie di montagne" in y or "iscriviti al nostro canale whatsapp" in y:skip=True
+  if not skip and not is_promo(x):out.append(x)
+  if skip and ("iscriverti su telegram" in y or "telegram" in y and "clicca qui" in y):skip=False
+ return out
 def article_text(s,e):
- # Prefer real article paragraphs over the short SEO/OG description.
  selectors=[".elementor-widget-theme-post-content",".entry-content",".post-content","article"]
  for sel in selectors:
   box=s.select_one(sel)
@@ -33,26 +44,19 @@ def article_text(s,e):
    for p in box.find_all(["p","h2","h3"],recursive=True):
     x=clean(p.get_text(" ",strip=True))
     if len(x)>=25 and x not in parts:parts.append(x)
-   text="\n\n".join(parts)
+   parts=strip_promos(parts);text="\n\n".join(parts)
    if len(text)>=150:return text
- raw=clean(str(getattr(e,"summary","")))
- if raw:return raw
- d=s.find("meta",property="og:description") or s.find("meta",attrs={"name":"description"})
- return clean(d.get("content","") if d else "")
+ raw=clean(str(getattr(e,"summary","")));return "" if is_promo(raw) else raw
 def latest_article(rss):
  f=feedparser.parse(rss)
  if not f.entries:raise RuntimeError("Nessun articolo disponibile nel feed RSS.")
  e=f.entries[0];link=str(getattr(e,"link","")).strip();title=clean(str(getattr(e,"title","")))
  if not link or not title:raise RuntimeError("Ultimo articolo RSS incompleto.")
- r=requests.get(link,timeout=20,headers={"User-Agent":"Mozilla/5.0"});r.raise_for_status();s=BeautifulSoup(r.text,"html.parser")
- og=s.find("meta",property="og:image");image=(og.get("content") or "").strip() if og else ""
+ r=requests.get(link,timeout=20,headers={"User-Agent":"Mozilla/5.0"});r.raise_for_status();s=BeautifulSoup(r.text,"html.parser");og=s.find("meta",property="og:image");image=(og.get("content") or "").strip() if og else ""
  if not image:raise RuntimeError("Immagine in evidenza pubblica (og:image) non trovata.")
- body=article_text(s,e)
- words=[w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+",title) if len(w)>3][:6];tags=" ".join("#"+re.sub(r"[^a-z0-9à-ÿ]","",w) for w in words)
- suffix=f"\n\n{tags}\n\n👉 {HUB_LINK}"; available=max(0,2200-len(title)-4-len(suffix)); body=body[:available].rstrip()
+ body=article_text(s,e);words=[w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+",title) if len(w)>3][:6];tags=" ".join("#"+re.sub(r"[^a-z0-9à-ÿ]","",w) for w in words);suffix=f"\n\n{tags}\n\n👉 {HUB_LINK}";available=max(0,2200-len(title)-4-len(suffix));body=body[:available].rstrip()
  if len(body)>=available and available>4:body=body.rsplit(" ",1)[0].rstrip()+"…"
- caption=f"{title}\n\n{body}{suffix}"[:2200]
- return {"title":title,"link":link,"image_url":image,"caption":caption}
+ return {"title":title,"link":link,"image_url":image,"caption":f"{title}\n\n{body}{suffix}"[:2200]}
 def create_and_publish(t,u,a):
  d=api_error(requests.post(f"{GRAPH_BASE}/v24.0/{u}/media",data={"image_url":a["image_url"],"caption":a["caption"],"access_token":t},timeout=30));cid=str(d.get("id") or "")
  if not cid:raise RuntimeError("Meta non ha restituito il creation_id.")
@@ -104,4 +108,4 @@ def status():return jsonify({"version":APP_VERSION,**{k:v for k,v in state.items
 def get_logs():return "\n".join(logs[-600:]),200,{"Content-Type":"text/plain; charset=utf-8"}
 @app.post("/clear_logs")
 def clear_logs():logs.clear();state["last_error"]="";return jsonify({"ok":True})
-if __name__=="__main__":log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🌐 Solo API ufficiale Meta. instagrapi non viene caricato.");log("📝 Testo Instagram esteso dal corpo dell'articolo; link principale montagneepaesi.com.");app.run(host="0.0.0.0",port=8080)
+if __name__=="__main__":log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🌐 Solo API ufficiale Meta. instagrapi non viene caricato.");log("🧹 Blocchi promozionali WhatsApp/Telegram esclusi dalle caption.");app.run(host="0.0.0.0",port=8080)

@@ -1,16 +1,15 @@
-"""WAHA dashboard/config patch for Instagram bot v1.1.4."""
+"""WAHA dashboard/config patch for Instagram bot v1.1.5."""
 import safe_app as safe
 
 core = safe.core
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 core.metrics["version"] = APP_VERSION
 
-# Keep the original config loader from app.py. WAHA values are stored in /data/config.json.
 base_load_config = safe._original_load_config
 base_save_config = safe._original_save_config
 
 
-def load_config_v114():
+def load_config_v115():
     cfg = base_load_config()
     cfg.setdefault("waha_url", safe.DEFAULT_WAHA_URL)
     cfg.setdefault("waha_session", safe.DEFAULT_WAHA_SESSION)
@@ -19,10 +18,10 @@ def load_config_v114():
     return cfg
 
 
-core.load_config = load_config_v114
+core.load_config = load_config_v115
 
 
-def notification_config_v114():
+def notification_config_v115():
     cfg = core.load_config()
     url = str(cfg.get("waha_url") or safe.DEFAULT_WAHA_URL).strip().rstrip("/")
     if url.endswith("/dashboard"):
@@ -38,8 +37,8 @@ def notification_config_v114():
     return url, session, digits, api_key
 
 
-def send_waha_notification_v114(message: str) -> bool:
-    url, session, number, api_key = notification_config_v114()
+def send_waha_notification_v115(message: str) -> bool:
+    url, session, number, api_key = notification_config_v115()
     if not url or not session or not number:
         core.log("⚠️ Notifica WAHA non configurata.")
         return False
@@ -59,8 +58,7 @@ def send_waha_notification_v114(message: str) -> bool:
         return False
 
 
-# Replace globals used by stop_with_error and the existing /test_waha route.
-safe.send_waha_notification = send_waha_notification_v114
+safe.send_waha_notification = send_waha_notification_v115
 
 
 @core.app.post("/save_waha")
@@ -70,7 +68,6 @@ def save_waha():
     cfg["waha_session"] = core.request.form.get("waha_session", "").strip() or safe.DEFAULT_WAHA_SESSION
     cfg["waha_number"] = core.request.form.get("waha_number", "").strip() or safe.DEFAULT_WAHA_NUMBER
     new_key = core.request.form.get("waha_api_key", "").strip()
-    # Empty field means keep the already saved key.
     if new_key:
         cfg["waha_api_key"] = new_key
     base_save_config(cfg)
@@ -78,8 +75,16 @@ def save_waha():
     return core.redirect("/")
 
 
-# Override status so the UI reports the current wrapper version.
-def status_v114():
+@core.app.post("/clear_logs")
+def clear_logs():
+    """Clear dashboard log and last_error without touching bot/session/config state."""
+    with core.logs_lock:
+        core.logs.clear()
+    core.set_metric("last_error", "")
+    return core.jsonify({"ok": True})
+
+
+def status_v115():
     with core.bot_lock:
         thread_alive = core.bot_thread is not None and core.bot_thread.is_alive()
     with core.metrics_lock:
@@ -88,7 +93,7 @@ def status_v114():
     return core.jsonify({"running": bool(thread_alive and not blocked), "blocked": blocked, "version": APP_VERSION})
 
 
-core.app.view_functions["status"] = status_v114
+core.app.view_functions["status"] = status_v115
 
 cfg = core.load_config()
 waha_url = str(cfg.get("waha_url", safe.DEFAULT_WAHA_URL)).replace('"', '&quot;')
@@ -97,9 +102,8 @@ waha_number = str(cfg.get("waha_number", safe.DEFAULT_WAHA_NUMBER)).replace('"',
 key_saved = bool(str(cfg.get("waha_api_key", "")).strip())
 key_state = "API Key salvata" if key_saved else "API Key NON configurata"
 
-# safe_app already changed the original heading to 1.1.3: bump the visible version.
 core.PAGE = core.PAGE.replace("Versione <b>1.1.3</b>", f"Versione <b>{APP_VERSION}</b>")
-core.PAGE = core.PAGE.replace("Sicurezza 1.1.3:", "Sicurezza 1.1.4:")
+core.PAGE = core.PAGE.replace("Sicurezza 1.1.3:", "Sicurezza 1.1.5:")
 
 waha_box = f'''
 <div style="margin-top:18px;padding:14px;border:1px solid #ddd;border-radius:10px;">
@@ -120,13 +124,61 @@ waha_box = f'''
 </div>
 '''
 
-# Insert the configuration panel inside the existing main form, before its closing tag.
 marker = "</form>"
 if marker in core.PAGE:
     core.PAGE = core.PAGE.replace(marker, waha_box + marker, 1)
 
+# Add dashboard log controls. Copy uses Clipboard API when available and falls back
+# to a temporary textarea, useful when the dashboard is opened through HA ingress.
+old_refresh_button = '<button class="btn stop" onclick="refresh()">Aggiorna</button>'
+new_log_controls = '''<div class="row" style="margin-top:0;">
+        <button class="btn stop" type="button" onclick="copyLog()">Copia log</button>
+        <button class="btn stop" type="button" onclick="clearLog()">Azzera log</button>
+        <button class="btn stop" type="button" onclick="refresh()">Aggiorna</button>
+      </div>'''
+core.PAGE = core.PAGE.replace(old_refresh_button, new_log_controls)
+
+script_marker = "async function refresh(){"
+log_js = r'''
+async function copyLog(){
+  const text = document.getElementById('log').textContent || '';
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    alert('Log copiato negli appunti.');
+  } catch(e) {
+    alert('Impossibile copiare automaticamente il log.');
+  }
+}
+async function clearLog(){
+  if (!confirm('Azzerare il log e cancellare l’ultimo errore visualizzato?')) return;
+  try {
+    const r = await fetch('/clear_logs', {method:'POST'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    document.getElementById('log').textContent = '';
+    await refresh();
+  } catch(e) {
+    alert('Errore durante l’azzeramento del log: ' + e.message);
+  }
+}
+'''
+if script_marker in core.PAGE:
+    core.PAGE = core.PAGE.replace(script_marker, log_js + "\n" + script_marker, 1)
+
 
 if __name__ == "__main__":
     core.log(f"🟢 Web UI pronta. Versione {APP_VERSION}.")
-    core.log("📲 WAHA 1.1.4: API Key configurabile dalla dashboard.")
+    core.log("📲 WAHA 1.1.5: API Key configurabile dalla dashboard.")
+    core.log("🧹 Log 1.1.5: disponibili Copia log e Azzera log.")
     core.app.run(host="0.0.0.0", port=8080)

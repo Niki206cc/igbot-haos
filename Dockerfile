@@ -12,9 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
-COPY safe_app.py .
-COPY waha_patch.py .
+COPY meta_v2.py .
 
 EXPOSE 8080
-CMD ["python", "waha_patch.py"]
+CMD ["python", "meta_v2.py"]

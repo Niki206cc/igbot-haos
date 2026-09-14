@@ -1,14 +1,12 @@
-"""Montagne & Paesi Instagram Bot v2.2.1 - official Meta API, independent RSS scanner."""
-import html,json,os,re,threading,time
+"""Montagne & Paesi Instagram Bot v2.2.2 - duplicate guard and smarter hashtags."""
+import html,json,os,re,threading,time,unicodedata
 from datetime import datetime,timedelta
 import requests,feedparser
 from bs4 import BeautifulSoup
 from flask import Flask,request,redirect,jsonify,render_template_string
-
-APP_VERSION="2.2.1";CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json");LAST_POST_PATH="/data/last_post_meta.txt";STATE_PATH="/data/meta_queue_state.json";GRAPH_BASE="https://graph.instagram.com";DEFAULT_IG_USER_ID="17841409303885274";DEFAULT_RSS="https://www.montagneepaesi.com/feed/";HUB_LINK="www.montagneepaesi.com";PUBLISH_GAP=60
+APP_VERSION="2.2.2";CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json");LAST_POST_PATH="/data/last_post_meta.txt";STATE_PATH="/data/meta_queue_state.json";GRAPH_BASE="https://graph.instagram.com";DEFAULT_IG_USER_ID="17841409303885274";DEFAULT_RSS="https://www.montagneepaesi.com/feed/";HUB_LINK="www.montagneepaesi.com";PUBLISH_GAP=60;DUPLICATE_TTL=86400
 app=Flask(__name__);logs=[];lock=threading.RLock();store_lock=threading.RLock();stop_event=threading.Event();bot_thread=None;scanner_thread=None
 state={"running":False,"meta_connected":False,"username":"","last_error":"","last_check":"","last_published":"","preview":{},"queue":[],"next_publish_at":0}
-
 def log(m):
  line=f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {m}"
  with lock:logs.append(line);del logs[:-600]
@@ -27,7 +25,7 @@ def load_store():
   with open(STATE_PATH,"r",encoding="utf-8") as f:x=json.load(f)
   if not isinstance(x,dict):raise ValueError()
  except Exception:x={}
- x.setdefault("initialized",False);x.setdefault("seen",[]);x.setdefault("queue",[]);x.setdefault("stats",{});x.setdefault("reports_sent",[]);return x
+ x.setdefault("initialized",False);x.setdefault("seen",[]);x.setdefault("queue",[]);x.setdefault("stats",{});x.setdefault("reports_sent",[]);x.setdefault("title_history",[]);return x
 def save_store(x):atomic_json(STATE_PATH,x)
 def api(r):
  try:d=r.json()
@@ -36,6 +34,16 @@ def api(r):
  return d
 def meta_test(t,u):return api(requests.get(f"{GRAPH_BASE}/v24.0/{u}",params={"fields":"id,username","access_token":t},timeout=20))
 def clean(x):return re.sub(r"\s+"," ",BeautifulSoup(x or "","html.parser").get_text(" ",strip=True)).strip()
+def normalize_title(x):
+ x=unicodedata.normalize("NFKD",clean(x)).encode("ascii","ignore").decode().lower();x=re.sub(r"\s+[0-9]+\s*$","",x);return re.sub(r"[^a-z0-9]+"," ",x).strip()
+def prune_history(store):
+ cutoff=time.time()-DUPLICATE_TTL;store["title_history"]=[x for x in store.get("title_history",[]) if float(x.get("ts",0))>=cutoff]
+def duplicate_title(store,title):
+ prune_history(store);n=normalize_title(title)
+ return bool(n) and any(x.get("normalized")==n for x in store["title_history"])
+def remember_title(store,title):
+ prune_history(store);n=normalize_title(title)
+ if n:store["title_history"].append({"normalized":n,"title":clean(title),"ts":time.time()})
 def is_promo(x):
  y=x.lower();return any(z in y for z in ["ricevi gratis le notizie di montagne","iscriviti al nostro canale whatsapp","clicca qui per iscriverti al canale","seguici anche su telegram","unisciti al canale telegram","clicca qui per iscriverti su telegram"])
 def article_text(s,e):
@@ -51,6 +59,22 @@ def article_text(s,e):
   text="\n\n".join(parts)
   if len(text)>=150:return text
  raw=clean(str(getattr(e,"summary","")));return "" if is_promo(raw) else raw
+def smart_hashtags(title,body):
+ stop={"della","delle","degli","dello","alla","alle","agli","allo","nella","nelle","negli","nello","dalla","dalle","dagli","dallo","oltre","anche","sono","come","dopo","prima","durante","verso","senza","sulla","sulle","sugli","sullo","questa","questo","presentazione","evento","articolo","notizia"}
+ text=clean(title);tokens=re.findall(r"[A-Za-zÀ-ÿ0-9]+",text);tags=[]
+ def add(v):
+  v=unicodedata.normalize("NFKD",v).encode("ascii","ignore").decode();v=re.sub(r"[^A-Za-z0-9]","",v)
+  if len(v)>=3 and v.lower() not in {x.lower() for x in tags}:tags.append(v)
+ # Proper-name/location phrases from the title first.
+ phrases=re.findall(r"(?:[A-ZÀ-Ý][A-Za-zÀ-ÿ'’-]+(?:\s+(?:di|del|della|dei|degli|delle|San|Santa|Sant'|Monte|Valle))?\s*){1,4}",text)
+ for p in phrases:
+  words=[w for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+",p) if w.lower() not in stop]
+  if words:add("".join(w[:1].upper()+w[1:] for w in words))
+ for w in tokens:
+  if len(w)>=5 and w.lower() not in stop:add(w[:1].upper()+w[1:])
+ for place in ["Bergamo","Brescia","Lombardia","Franciacorta","ValSeriana","ValBrembana","ValCamonica"]:
+  if place.lower() in (title+" "+body).lower():add(place)
+ add("MontagneEPaesi");return " ".join("#"+x for x in tags[:8])
 def feed_items(rss):
  f=feedparser.parse(rss)
  if not f.entries:raise RuntimeError("Nessun articolo disponibile nel feed RSS.")
@@ -63,7 +87,7 @@ def feed_items(rss):
 def build_article(item,entry=None):
  link=item["link"];title=item["title"];r=requests.get(link,timeout=20,headers={"User-Agent":"Mozilla/5.0"});r.raise_for_status();s=BeautifulSoup(r.text,"html.parser");og=s.find("meta",property="og:image");image=(og.get("content") or "").strip() if og else ""
  if not image:raise RuntimeError("Immagine in evidenza pubblica non trovata.")
- body=article_text(s,entry or type("E",(),{"summary":""})());words=[w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+",title) if len(w)>3][:6];tags=" ".join("#"+re.sub(r"[^a-z0-9à-ÿ]","",w) for w in words);suffix=f"\n\n{tags}\n\n👉 {HUB_LINK}";n=max(0,2200-len(title)-4-len(suffix));body=body[:n].rstrip()
+ body=article_text(s,entry or type("E",(),{"summary":""})());tags=smart_hashtags(title,body);suffix=f"\n\n{tags}\n\n👉 {HUB_LINK}";n=max(0,2200-len(title)-4-len(suffix));body=body[:n].rstrip()
  if len(body)>=n and n>4:body=body.rsplit(" ",1)[0].rstrip()+"…"
  return {"title":title,"link":link,"image_url":image,"caption":f"{title}\n\n{body}{suffix}"[:2200]}
 def latest_article(rss):
@@ -95,20 +119,26 @@ def sync_state(store):
 def discover(rss):
  items,_=feed_items(rss);links=[x["link"] for x in items]
  with store_lock:
-  store=load_store()
+  store=load_store();prune_history(store)
   if not store["initialized"]:
    old=last_link()
    if old and old in links:
     idx=links.index(old);new=list(reversed(items[:idx]));store["seen"]=links[idx:]
     for x in new:
+     if duplicate_title(store,x["title"]):log(f"⏭️ Duplicato ignorato (24h): {x['title']}");store["seen"].append(x["link"]);continue
      if x["link"] not in store["seen"]:store["queue"].append(x);store["seen"].append(x["link"])
-    if new:log(f"📚 Recuperati {len(new)} nuovi articoli dal feed.")
+    if new:log(f"📚 Recupero feed completato. Coda: {len(store['queue'])}.")
    else:store["seen"]=links[:];set_last(items[0]["link"]);log("🛡️ Baseline coda iniziale salvata: nessun vecchio articolo pubblicato.")
    store["initialized"]=True;save_store(store);sync_state(store);return
-  seen=set(store["seen"]);queued={x["link"] for x in store["queue"]};new=[x for x in items if x["link"] not in seen and x["link"] not in queued]
-  for x in reversed(new):store["queue"].append(x)
-  if new:
-   store["seen"].extend(x["link"] for x in new);store["seen"]=store["seen"][-300:];save_store(store);log(f"📚 Aggiunti {len(new)} articoli alla coda. Totale in coda: {len(store['queue'])}.")
+  seen=set(store["seen"]);queued={x["link"] for x in store["queue"]};queued_titles={normalize_title(x.get("title","")) for x in store["queue"]};new=[x for x in items if x["link"] not in seen and x["link"] not in queued]
+  added=0
+  for x in reversed(new):
+   nt=normalize_title(x["title"])
+   if duplicate_title(store,x["title"]) or nt in queued_titles:
+    log(f"⏭️ Duplicato ignorato (24h): {x['title']}");store["seen"].append(x["link"]);continue
+   store["queue"].append(x);queued_titles.add(nt);store["seen"].append(x["link"]);added+=1
+  store["seen"]=store["seen"][-300:];save_store(store)
+  if added:log(f"📚 Aggiunti {added} articoli alla coda. Totale in coda: {len(store['queue'])}.")
   sync_state(store)
 def waha(msg):
  c=load_config();url=str(c.get("waha_url") or "").rstrip("/");session=str(c.get("waha_session") or "default");number="".join(ch for ch in str(c.get("waha_number") or "") if ch.isdigit());key=str(c.get("waha_api_key") or "")
@@ -149,8 +179,12 @@ def loop():
   while not stop_event.is_set():
    now=time.time()
    with store_lock:
-    store=load_store();item=store["queue"][0] if store["queue"] else None;sync_state(store)
+    store=load_store();prune_history(store);item=store["queue"][0] if store["queue"] else None;sync_state(store)
    if item and now>=next_pub:
+    with store_lock:
+     store=load_store()
+     if duplicate_title(store,item["title"]):
+      store["queue"]=[x for x in store["queue"] if x.get("link")!=item["link"]];save_store(store);sync_state(store);log(f"⏭️ Pubblicazione annullata, titolo già pubblicato nelle ultime 24h: {item['title']}");continue
     log(f"🆕 Pubblicazione dalla coda: {item['title']}")
     try:
      a=build_article(item);state["preview"]=a;mid=publish(token,uid,a)
@@ -158,7 +192,7 @@ def loop():
       store=load_store()
       if store["queue"] and store["queue"][0].get("link")==item["link"]:store["queue"].pop(0)
       else:store["queue"]=[x for x in store["queue"] if x.get("link")!=item["link"]]
-      set_last(item["link"]);stat_inc(store,"published");save_store(store);sync_state(store);has_more=bool(store["queue"])
+      set_last(item["link"]);remember_title(store,item["title"]);stat_inc(store,"published");save_store(store);sync_state(store);has_more=bool(store["queue"])
      state["last_published"]=item["title"];log(f"✅ Pubblicato via API Meta. Media ID: {mid}");next_pub=time.time()+PUBLISH_GAP;state["next_publish_at"]=next_pub if has_more else 0
     except Exception:
      with store_lock:store=load_store();stat_inc(store,"errors");save_store(store)
@@ -199,7 +233,7 @@ def start():
 @app.post("/stop")
 def stop():stop_event.set();state["running"]=False;log("⏹️ Arresto richiesto dal pannello.");return redirect("/")
 @app.post("/test_waha")
-def test_waha():save_config(formcfg());waha("Test Montagne & Paesi: notifiche Instagram Bot v2.2.1 funzionanti.");return redirect("/")
+def test_waha():save_config(formcfg());waha("Test Montagne & Paesi: notifiche Instagram Bot v2.2.2 funzionanti.");return redirect("/")
 @app.get("/status")
 def status():
  with lock:
@@ -214,4 +248,4 @@ def clearlogs():
  return jsonify({"ok":True})
 threading.Thread(target=report_loop,daemon=True).start()
 if __name__=="__main__":
- log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🌐 API ufficiale Meta; scanner RSS e publisher Instagram indipendenti.");app.run(host="0.0.0.0",port=8080)
+ log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🌐 API Meta; scanner indipendente, anti-duplicato titoli 24h e hashtag intelligenti attivi.");app.run(host="0.0.0.0",port=8080)

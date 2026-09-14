@@ -1,10 +1,10 @@
-"""Montagne & Paesi Instagram Bot v2.1 - official Meta API only."""
+"""Montagne & Paesi Instagram Bot v2.1.1 - official Meta API only."""
 import html,json,os,re,threading,time
 from datetime import datetime
 import requests,feedparser
 from bs4 import BeautifulSoup
 from flask import Flask,request,redirect,jsonify,render_template_string
-APP_VERSION="2.1.0";CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json");LAST_POST_PATH="/data/last_post_meta.txt";GRAPH_BASE="https://graph.instagram.com";DEFAULT_IG_USER_ID="17841409303885274";DEFAULT_RSS="https://www.montagneepaesi.com/feed/";HUB_LINK="www.montagneepaesi.com"
+APP_VERSION="2.1.1";CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json");LAST_POST_PATH="/data/last_post_meta.txt";GRAPH_BASE="https://graph.instagram.com";DEFAULT_IG_USER_ID="17841409303885274";DEFAULT_RSS="https://www.montagneepaesi.com/feed/";HUB_LINK="www.montagneepaesi.com"
 app=Flask(__name__);logs=[];lock=threading.Lock();stop_event=threading.Event();bot_thread=None
 state={"running":False,"meta_connected":False,"username":"","last_error":"","last_check":"","last_published":"","preview":{}}
 def log(m):
@@ -51,9 +51,21 @@ def latest_article(rss):
  body=article_text(s,e);words=[w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+",title) if len(w)>3][:6];tags=" ".join("#"+re.sub(r"[^a-z0-9à-ÿ]","",w) for w in words);suffix=f"\n\n{tags}\n\n👉 {HUB_LINK}";n=max(0,2200-len(title)-4-len(suffix));body=body[:n].rstrip()
  if len(body)>=n and n>4:body=body.rsplit(" ",1)[0].rstrip()+"…"
  return {"title":title,"link":link,"image_url":image,"caption":f"{title}\n\n{body}{suffix}"[:2200]}
+def wait_container(t,cid):
+ # Meta can accept /media before the image container is actually ready. Poll the
+ # SAME container only; never recreate it, so a transient processing delay cannot
+ # generate duplicate posts.
+ for attempt in range(1,13):
+  d=api(requests.get(f"{GRAPH_BASE}/v24.0/{cid}",params={"fields":"status_code,status","access_token":t},timeout=20));status=str(d.get("status_code") or "").upper();detail=str(d.get("status") or "")
+  log(f"⏳ Container Meta {cid}: {status or detail or 'stato non disponibile'} ({attempt}/12)")
+  if status=="FINISHED":return
+  if status in ("ERROR","EXPIRED"):raise RuntimeError(f"Elaborazione media Meta fallita: {detail or status}")
+  if stop_event.wait(5):raise RuntimeError("Pubblicazione interrotta: arresto bot richiesto.")
+ raise RuntimeError("Il container Meta non è diventato pronto entro 60 secondi.")
 def publish(t,u,a):
  d=api(requests.post(f"{GRAPH_BASE}/v24.0/{u}/media",data={"image_url":a["image_url"],"caption":a["caption"],"access_token":t},timeout=30));cid=str(d.get("id") or "")
  if not cid:raise RuntimeError("creation_id Meta mancante.")
+ log(f"📦 Container Meta creato: {cid}");wait_container(t,cid)
  d=api(requests.post(f"{GRAPH_BASE}/v24.0/{u}/media_publish",data={"creation_id":cid,"access_token":t},timeout=30));mid=str(d.get("id") or "")
  if not mid:raise RuntimeError("Media ID Meta mancante.")
  return mid
@@ -116,7 +128,7 @@ def start():
 @app.post("/stop")
 def stop():stop_event.set();state["running"]=False;log("⏹️ Arresto richiesto dal pannello.");return redirect("/")
 @app.post("/test_waha")
-def test_waha():save_config(formcfg());waha("Test Montagne & Paesi: notifiche Instagram Bot v2.1 funzionanti.");return redirect("/")
+def test_waha():save_config(formcfg());waha("Test Montagne & Paesi: notifiche Instagram Bot v2.1.1 funzionanti.");return redirect("/")
 @app.get("/status")
 def status():return jsonify({k:v for k,v in state.items() if k!="preview"}|{"version":APP_VERSION})
 @app.get("/logs")
@@ -126,4 +138,4 @@ def getlogs():
 def clearlogs():
  with lock:logs.clear()
  return jsonify({"ok":True})
-if __name__=="__main__":log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🌐 API ufficiale Meta; pubblicazione automatica con anti-duplicato e fail-safe WAHA.");app.run(host="0.0.0.0",port=8080)
+if __name__=="__main__":log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🌐 API ufficiale Meta; attesa elaborazione container prima della pubblicazione.");app.run(host="0.0.0.0",port=8080)

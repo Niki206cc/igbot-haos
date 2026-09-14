@@ -1,51 +1,45 @@
-"""Montagne & Paesi Instagram Bot v2.0.3 - official Meta API publishing test."""
-import html, json, os, re
+"""Montagne & Paesi Instagram Bot v2.1 - official Meta API only."""
+import html,json,os,re,threading,time
 from datetime import datetime
-import requests, feedparser
+import requests,feedparser
 from bs4 import BeautifulSoup
-from flask import Flask, request, redirect, jsonify, render_template_string
-APP_VERSION="2.0.3-test"; CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json"); LAST_POST_PATH=os.environ.get("LAST_POST_PATH","/data/last_post_meta.txt"); GRAPH_BASE=os.environ.get("META_GRAPH_BASE","https://graph.instagram.com"); DEFAULT_IG_USER_ID="17841409303885274"; DEFAULT_RSS="https://www.montagneepaesi.com/feed/"; HUB_LINK="www.montagneepaesi.com"
-app=Flask(__name__); logs=[]; state={"meta_connected":False,"username":"","last_error":"","preview":{}}
+from flask import Flask,request,redirect,jsonify,render_template_string
+APP_VERSION="2.1.0";CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json");LAST_POST_PATH="/data/last_post_meta.txt";GRAPH_BASE="https://graph.instagram.com";DEFAULT_IG_USER_ID="17841409303885274";DEFAULT_RSS="https://www.montagneepaesi.com/feed/";HUB_LINK="www.montagneepaesi.com"
+app=Flask(__name__);logs=[];lock=threading.Lock();stop_event=threading.Event();bot_thread=None
+state={"running":False,"meta_connected":False,"username":"","last_error":"","last_check":"","last_published":"","preview":{}}
 def log(m):
- line=f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {m}";logs.append(line);del logs[:-600];print(line,flush=True)
+ line=f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {m}"
+ with lock:logs.append(line);del logs[:-600]
+ print(line,flush=True)
 def load_config():
  try:
   with open(CONFIG_PATH,"r",encoding="utf-8") as f:x=json.load(f);return x if isinstance(x,dict) else {}
  except Exception:return {}
 def save_config(c):
- os.makedirs(os.path.dirname(CONFIG_PATH),exist_ok=True);t=CONFIG_PATH+".tmp"
- with open(t,"w",encoding="utf-8") as f:json.dump(c,f,ensure_ascii=False,indent=2)
- os.replace(t,CONFIG_PATH)
-def api_error(r):
+ os.makedirs(os.path.dirname(CONFIG_PATH),exist_ok=True);p=CONFIG_PATH+".tmp"
+ with open(p,"w",encoding="utf-8") as f:json.dump(c,f,ensure_ascii=False,indent=2)
+ os.replace(p,CONFIG_PATH)
+def api(r):
  try:d=r.json()
  except Exception:d={}
  if not r.ok:raise RuntimeError((d.get("error") or {}).get("message") or f"Meta API HTTP {r.status_code}")
  return d
-def meta_test(t,u):return api_error(requests.get(f"{GRAPH_BASE}/v24.0/{u}",params={"fields":"id,username","access_token":t},timeout=20))
-def clean(s):return re.sub(r"\s+"," ",BeautifulSoup(s or "","html.parser").get_text(" ",strip=True)).strip()
+def meta_test(t,u):return api(requests.get(f"{GRAPH_BASE}/v24.0/{u}",params={"fields":"id,username","access_token":t},timeout=20))
+def clean(x):return re.sub(r"\s+"," ",BeautifulSoup(x or "","html.parser").get_text(" ",strip=True)).strip()
 def is_promo(x):
- y=x.lower()
- markers=["ricevi gratis le notizie di montagne & paesi","ricevi gratis le notizie di montagne e paesi","iscriviti al nostro canale whatsapp","clicca qui per iscriverti al canale","seguici anche su telegram","unisciti al canale telegram","clicca qui per iscriverti su telegram"]
- return any(m in y for m in markers)
-def strip_promos(parts):
- out=[];skip=False
- for x in parts:
-  y=x.lower()
-  if "ricevi gratis le notizie di montagne" in y or "iscriviti al nostro canale whatsapp" in y:skip=True
-  if not skip and not is_promo(x):out.append(x)
-  if skip and ("iscriverti su telegram" in y or "telegram" in y and "clicca qui" in y):skip=False
- return out
+ y=x.lower();return any(z in y for z in ["ricevi gratis le notizie di montagne","iscriviti al nostro canale whatsapp","clicca qui per iscriverti al canale","seguici anche su telegram","unisciti al canale telegram","clicca qui per iscriverti su telegram"])
 def article_text(s,e):
- selectors=[".elementor-widget-theme-post-content",".entry-content",".post-content","article"]
- for sel in selectors:
+ for sel in [".elementor-widget-theme-post-content",".entry-content",".post-content","article"]:
   box=s.select_one(sel)
-  if box:
-   parts=[]
-   for p in box.find_all(["p","h2","h3"],recursive=True):
-    x=clean(p.get_text(" ",strip=True))
-    if len(x)>=25 and x not in parts:parts.append(x)
-   parts=strip_promos(parts);text="\n\n".join(parts)
-   if len(text)>=150:return text
+  if not box:continue
+  parts=[];skip=False
+  for p in box.find_all(["p","h2","h3"]):
+   x=clean(p.get_text(" ",strip=True));y=x.lower()
+   if "ricevi gratis le notizie di montagne" in y or "iscriviti al nostro canale whatsapp" in y:skip=True
+   if not skip and len(x)>=25 and not is_promo(x) and x not in parts:parts.append(x)
+   if skip and "telegram" in y and "clicca qui" in y:skip=False
+  text="\n\n".join(parts)
+  if len(text)>=150:return text
  raw=clean(str(getattr(e,"summary","")));return "" if is_promo(raw) else raw
 def latest_article(rss):
  f=feedparser.parse(rss)
@@ -53,59 +47,83 @@ def latest_article(rss):
  e=f.entries[0];link=str(getattr(e,"link","")).strip();title=clean(str(getattr(e,"title","")))
  if not link or not title:raise RuntimeError("Ultimo articolo RSS incompleto.")
  r=requests.get(link,timeout=20,headers={"User-Agent":"Mozilla/5.0"});r.raise_for_status();s=BeautifulSoup(r.text,"html.parser");og=s.find("meta",property="og:image");image=(og.get("content") or "").strip() if og else ""
- if not image:raise RuntimeError("Immagine in evidenza pubblica (og:image) non trovata.")
- body=article_text(s,e);words=[w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+",title) if len(w)>3][:6];tags=" ".join("#"+re.sub(r"[^a-z0-9à-ÿ]","",w) for w in words);suffix=f"\n\n{tags}\n\n👉 {HUB_LINK}";available=max(0,2200-len(title)-4-len(suffix));body=body[:available].rstrip()
- if len(body)>=available and available>4:body=body.rsplit(" ",1)[0].rstrip()+"…"
+ if not image:raise RuntimeError("Immagine in evidenza pubblica non trovata.")
+ body=article_text(s,e);words=[w.lower() for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+",title) if len(w)>3][:6];tags=" ".join("#"+re.sub(r"[^a-z0-9à-ÿ]","",w) for w in words);suffix=f"\n\n{tags}\n\n👉 {HUB_LINK}";n=max(0,2200-len(title)-4-len(suffix));body=body[:n].rstrip()
+ if len(body)>=n and n>4:body=body.rsplit(" ",1)[0].rstrip()+"…"
  return {"title":title,"link":link,"image_url":image,"caption":f"{title}\n\n{body}{suffix}"[:2200]}
-def create_and_publish(t,u,a):
- d=api_error(requests.post(f"{GRAPH_BASE}/v24.0/{u}/media",data={"image_url":a["image_url"],"caption":a["caption"],"access_token":t},timeout=30));cid=str(d.get("id") or "")
- if not cid:raise RuntimeError("Meta non ha restituito il creation_id.")
- log(f"📦 Container Meta creato: {cid}");d=api_error(requests.post(f"{GRAPH_BASE}/v24.0/{u}/media_publish",data={"creation_id":cid,"access_token":t},timeout=30));mid=str(d.get("id") or "")
- if not mid:raise RuntimeError("Meta non ha restituito l'ID del post pubblicato.")
+def publish(t,u,a):
+ d=api(requests.post(f"{GRAPH_BASE}/v24.0/{u}/media",data={"image_url":a["image_url"],"caption":a["caption"],"access_token":t},timeout=30));cid=str(d.get("id") or "")
+ if not cid:raise RuntimeError("creation_id Meta mancante.")
+ d=api(requests.post(f"{GRAPH_BASE}/v24.0/{u}/media_publish",data={"creation_id":cid,"access_token":t},timeout=30));mid=str(d.get("id") or "")
+ if not mid:raise RuntimeError("Media ID Meta mancante.")
  return mid
-def cfg_from_form():
- c=load_config();c["meta_ig_user_id"]=request.form.get("ig_user_id","").strip() or str(c.get("meta_ig_user_id") or DEFAULT_IG_USER_ID);c["rss_url"]=request.form.get("rss_url","").strip() or str(c.get("rss_url") or DEFAULT_RSS);t=request.form.get("meta_access_token","").strip()
- if t:c["meta_access_token"]=t
+def last_link():
+ try:
+  with open(LAST_POST_PATH,"r",encoding="utf-8") as f:return f.read().strip()
+ except Exception:return ""
+def set_last(x):
+ os.makedirs("/data",exist_ok=True)
+ with open(LAST_POST_PATH,"w",encoding="utf-8") as f:f.write(x)
+def waha(msg):
+ c=load_config();url=str(c.get("waha_url") or "").rstrip("/");session=str(c.get("waha_session") or "default");number="".join(ch for ch in str(c.get("waha_number") or "") if ch.isdigit());key=str(c.get("waha_api_key") or "")
+ if number.startswith("00"):number=number[2:]
+ if len(number)==10 and number.startswith("3"):number="39"+number
+ if not(url and number and key):log("⚠️ WAHA non completamente configurato.");return False
+ try:requests.post(f"{url}/api/sendText",json={"session":session,"chatId":f"{number}@c.us","text":msg},headers={"X-Api-Key":key},timeout=10).raise_for_status();log("📲 Notifica WAHA inviata.");return True
+ except Exception as e:log(f"⚠️ WAHA fallito: {e}");return False
+def loop():
+ global bot_thread
+ c=load_config();interval=max(60,int(c.get("check_interval") or 60));token=str(c.get("meta_access_token") or "");uid=str(c.get("meta_ig_user_id") or DEFAULT_IG_USER_ID);rss=str(c.get("rss_url") or DEFAULT_RSS)
+ try:
+  if not token:raise RuntimeError("Token Meta mancante.")
+  meta_test(token,uid);log(f"▶️ Bot automatico avviato. Controllo ogni {interval} secondi.")
+  while not stop_event.is_set():
+   state["last_check"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S");a=latest_article(rss);state["preview"]=a;last=last_link()
+   if not last:set_last(a["link"]);log("🛡️ Baseline iniziale salvata: nessun vecchio articolo pubblicato.")
+   elif a["link"]!=last:
+    log(f"🆕 Nuovo articolo: {a['title']}");mid=publish(token,uid,a);set_last(a["link"]);state["last_published"]=a["title"];log(f"✅ Pubblicato via API Meta. Media ID: {mid}")
+   if stop_event.wait(interval):break
+ except Exception as e:
+  state["last_error"]=str(e);log(f"🛑 Bot fermato per errore: {e}");waha(f"Montagne & Paesi - Instagram Bot fermato per errore: {e}")
+ finally:state["running"]=False;bot_thread=None;log("⏹️ Bot automatico fermo.")
+def formcfg():
+ c=load_config()
+ for k,default in [("meta_ig_user_id",DEFAULT_IG_USER_ID),("rss_url",DEFAULT_RSS),("waha_url",""),("waha_session","default"),("waha_number","")]:c[k]=request.form.get(k,"").strip() or str(c.get(k) or default)
+ for k in ["meta_access_token","waha_api_key"]:
+  v=request.form.get(k,"").strip()
+  if v:c[k]=v
+ try:c["check_interval"]=max(60,int(request.form.get("check_interval","") or c.get("check_interval") or 60))
+ except Exception:c["check_interval"]=60
  return c
-PAGE='''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>M&P Instagram Meta</title><style>body{font-family:Arial;background:#f5f6f8;padding:20px;color:#222}.box{max-width:950px;margin:auto;background:white;padding:22px;border-radius:12px}input{width:100%;box-sizing:border-box;padding:10px;margin:5px 0 12px}.btn{padding:10px 14px;margin:4px;border:0;border-radius:7px;cursor:pointer}.p{background:#1769e0;color:white}.test{background:#b45309;color:white}pre{background:#111;color:#eee;padding:12px;border-radius:8px;min-height:150px;white-space:pre-wrap}.small{font-size:13px;color:#666}.warn{color:#a45b00}.preview{background:#f7f7f7;padding:12px;border-radius:8px;margin-top:12px;white-space:pre-wrap}</style></head><body><div class="box"><h2>Montagne & Paesi → Instagram API ufficiale Meta</h2><div class="small">Versione <b>{{version}}</b></div><p class="warn"><b>Modalità test:</b> nessuna pubblicazione automatica. Test pubblicazione Meta pubblica davvero UNA sola volta l'ultimo articolo.</p><form method="post"><label>Instagram User ID</label><input name="ig_user_id" value="{{uid}}"><label>Instagram Access Token</label><input type="password" name="meta_access_token" placeholder="{% if saved %}Token salvato - lascia vuoto per mantenerlo{% else %}Incolla token Meta{% endif %}"><label>Feed RSS</label><input name="rss_url" value="{{rss}}"><button class="btn p" formaction="/save" formmethod="post">Salva configurazione</button><button class="btn p" formaction="/test_meta" formmethod="post">Test API Meta</button><button class="btn p" formaction="/preview" formmethod="post">Aggiorna anteprima</button><button class="btn test" formaction="/publish_test" formmethod="post" onclick="return confirm('ATTENZIONE: verrà pubblicato DAVVERO l’ultimo articolo su Instagram, una sola volta. Continuare?')">Test pubblicazione Meta</button></form>{% if preview %}<div class="preview"><b>Anteprima ultimo articolo</b>\n\n<b>{{preview.title}}</b>\n\n{{preview.caption}}\n\n<span class="small">Immagine: {{preview.image_url}}</span></div>{% endif %}<h3>Stato</h3><div id="state">API Meta: non verificata</div><h3>Log</h3><button class="btn" onclick="copyLog()">Copia log</button><button class="btn" onclick="clearLog()">Azzera log</button><pre id="log"></pre><script>async function refresh(){let s=await(await fetch('/status')).json();document.getElementById('state').textContent=s.meta_connected?'API Meta collegata: @'+s.username:'API Meta: non verificata';document.getElementById('log').textContent=await(await fetch('/logs')).text()}async function copyLog(){try{await navigator.clipboard.writeText(document.getElementById('log').textContent);alert('Log copiato.')}catch(e){}}async function clearLog(){await fetch('/clear_logs',{method:'POST'});refresh()}setInterval(refresh,2500);refresh()</script></div></body></html>'''
+PAGE='''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>M&P Instagram Bot</title><style>body{font-family:Arial;background:#f5f6f8;padding:20px}.box{max-width:950px;margin:auto;background:#fff;padding:22px;border-radius:12px}input{width:100%;box-sizing:border-box;padding:9px;margin:4px 0 10px}.btn{padding:10px 14px;margin:4px;border:0;border-radius:7px;cursor:pointer}.start{background:#16803b;color:#fff}.stop{background:#b42318;color:#fff}.blue{background:#1769e0;color:#fff}.card{padding:12px;background:#f7f7f7;border-radius:8px;margin-top:14px}.preview{white-space:pre-wrap}pre{background:#111;color:#eee;padding:12px;max-height:420px;overflow:auto;white-space:pre-wrap}.small{font-size:13px;color:#666}</style></head><body><div class="box"><h2>Montagne & Paesi → Instagram Bot</h2><div class="small">Versione <b>{{v}}</b> • API ufficiale Meta</div><form method="post"><h3>Instagram</h3><label>Instagram User ID</label><input name="meta_ig_user_id" value="{{uid}}"><label>Access Token Meta</label><input type="password" name="meta_access_token" placeholder="{% if token %}Token salvato{% else %}Token non configurato{% endif %}"><label>Feed RSS</label><input name="rss_url" value="{{rss}}"><label>Intervallo controllo (secondi, minimo 60)</label><input name="check_interval" value="{{interval}}"><h3>WhatsApp WAHA</h3><label>WAHA URL</label><input name="waha_url" value="{{wu}}"><label>Sessione</label><input name="waha_session" value="{{ws}}"><label>Numero destinatario</label><input name="waha_number" value="{{wn}}"><label>WAHA API Key</label><input type="password" name="waha_api_key" placeholder="{% if wk %}API Key salvata{% else %}API Key non configurata{% endif %}"><button class="btn blue" formaction="/save" formmethod="post">Salva</button><button class="btn blue" formaction="/preview" formmethod="post">Anteprima</button><button class="btn blue" formaction="/test_waha" formmethod="post">Test WAHA</button><button class="btn start" formaction="/start" formmethod="post">Avvia bot</button><button class="btn stop" formaction="/stop" formmethod="post">Ferma bot</button></form><div class="card"><b>Stato:</b> <span id="st"></span></div>{% if preview %}<div class="card preview"><b>Anteprima</b>\n\n{{preview.caption}}</div>{% endif %}<h3>Log</h3><button class="btn" onclick="copyLog()">Copia log</button><button class="btn" onclick="clearLog()">Azzera log</button><pre id="log"></pre><script>async function refresh(){let s=await(await fetch('/status')).json();document.getElementById('st').textContent=s.running?'ATTIVO':'FERMO';document.getElementById('log').textContent=await(await fetch('/logs')).text()}async function copyLog(){await navigator.clipboard.writeText(document.getElementById('log').textContent)}async function clearLog(){await fetch('/clear_logs',{method:'POST'});refresh()}setInterval(refresh,2500);refresh()</script></div></body></html>'''
 @app.get("/")
 def home():
- c=load_config();return render_template_string(PAGE,version=APP_VERSION,uid=html.escape(str(c.get("meta_ig_user_id") or DEFAULT_IG_USER_ID)),rss=html.escape(str(c.get("rss_url") or DEFAULT_RSS)),saved=bool(c.get("meta_access_token")),preview=state.get("preview"))
+ c=load_config();return render_template_string(PAGE,v=APP_VERSION,uid=html.escape(str(c.get("meta_ig_user_id") or DEFAULT_IG_USER_ID)),rss=html.escape(str(c.get("rss_url") or DEFAULT_RSS)),interval=c.get("check_interval",60),token=bool(c.get("meta_access_token")),wu=html.escape(str(c.get("waha_url") or "")),ws=html.escape(str(c.get("waha_session") or "default")),wn=html.escape(str(c.get("waha_number") or "")),wk=bool(c.get("waha_api_key")),preview=state["preview"])
 @app.post("/save")
-def save():save_config(cfg_from_form());log("💾 Configurazione salvata localmente. Token non visualizzato.");return redirect("/")
-@app.post("/test_meta")
-def test_meta_route():
- c=cfg_from_form();save_config(c);t=str(c.get("meta_access_token") or "")
- try:
-  if not t:raise RuntimeError("Token Meta mancante.")
-  d=meta_test(t,c["meta_ig_user_id"]);state.update(meta_connected=True,username=str(d.get("username") or ""),last_error="");log(f"✅ API Meta collegata: @{state['username']} • ID {d.get('id')}")
- except Exception as e:state.update(meta_connected=False,last_error=str(e));log(f"❌ Test API Meta fallito: {e}")
- return redirect("/")
+def save():save_config(formcfg());log("💾 Configurazione salvata. Le chiavi segrete non vengono visualizzate.");return redirect("/")
 @app.post("/preview")
 def preview():
- c=cfg_from_form();save_config(c)
- try:state["preview"]=latest_article(c["rss_url"]);log(f"👁️ Anteprima pronta: {state['preview']['title']} • caption {len(state['preview']['caption'])} caratteri")
- except Exception as e:state["last_error"]=str(e);log(f"❌ Anteprima fallita: {e}")
+ c=formcfg();save_config(c)
+ try:state["preview"]=latest_article(c["rss_url"]);log(f"👁️ Anteprima pronta: {state['preview']['title']}")
+ except Exception as e:log(f"❌ Anteprima fallita: {e}")
  return redirect("/")
-@app.post("/publish_test")
-def publish_test():
- c=cfg_from_form();save_config(c);t=str(c.get("meta_access_token") or "")
- try:
-  if not t:raise RuntimeError("Token Meta mancante.")
-  a=latest_article(c["rss_url"]);state["preview"]=a
-  try:
-   with open(LAST_POST_PATH,"r",encoding="utf-8") as f:last=f.read().strip()
-  except Exception:last=""
-  if last==a["link"]:raise RuntimeError("Questo articolo risulta già pubblicato dal bot Meta. Test annullato per evitare duplicati.")
-  log(f"🧪 Pubblicazione Meta singola: {a['title']}");mid=create_and_publish(t,c["meta_ig_user_id"],a);os.makedirs(os.path.dirname(LAST_POST_PATH),exist_ok=True)
-  with open(LAST_POST_PATH,"w",encoding="utf-8") as f:f.write(a["link"])
-  state["last_error"]="";log(f"✅ Pubblicazione ufficiale Meta riuscita. Media ID: {mid}");log("⏹️ Fine test: nessun retry e nessuna automazione attiva.")
- except Exception as e:state["last_error"]=str(e);log(f"🛑 Test pubblicazione fermato: {e}")
- return redirect("/")
+@app.post("/start")
+def start():
+ global bot_thread
+ save_config(formcfg())
+ if state["running"]:log("ℹ️ Bot già attivo.");return redirect("/")
+ stop_event.clear();state["running"]=True;state["last_error"]="";bot_thread=threading.Thread(target=loop,daemon=True);bot_thread.start();return redirect("/")
+@app.post("/stop")
+def stop():stop_event.set();state["running"]=False;log("⏹️ Arresto richiesto dal pannello.");return redirect("/")
+@app.post("/test_waha")
+def test_waha():save_config(formcfg());waha("Test Montagne & Paesi: notifiche Instagram Bot v2.1 funzionanti.");return redirect("/")
 @app.get("/status")
-def status():return jsonify({"version":APP_VERSION,**{k:v for k,v in state.items() if k!="preview"}})
+def status():return jsonify({k:v for k,v in state.items() if k!="preview"}|{"version":APP_VERSION})
 @app.get("/logs")
-def get_logs():return "\n".join(logs[-600:]),200,{"Content-Type":"text/plain; charset=utf-8"}
+def getlogs():
+ with lock:return "\n".join(logs),200,{"Content-Type":"text/plain; charset=utf-8"}
 @app.post("/clear_logs")
-def clear_logs():logs.clear();state["last_error"]="";return jsonify({"ok":True})
-if __name__=="__main__":log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🌐 Solo API ufficiale Meta. instagrapi non viene caricato.");log("🧹 Blocchi promozionali WhatsApp/Telegram esclusi dalle caption.");app.run(host="0.0.0.0",port=8080)
+def clearlogs():
+ with lock:logs.clear()
+ return jsonify({"ok":True})
+if __name__=="__main__":log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🌐 API ufficiale Meta; pubblicazione automatica con anti-duplicato e fail-safe WAHA.");app.run(host="0.0.0.0",port=8080)

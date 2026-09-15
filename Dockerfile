@@ -13,6 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY meta_v2.py .
+COPY smart_v2.py .
 
 EXPOSE 8080
-CMD ["python", "meta_v2.py"]
+CMD ["python", "smart_v2.py"]

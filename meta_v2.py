@@ -1,12 +1,12 @@
-"""Montagne & Paesi Instagram Bot v2.2.6 - Meta publishing-limit hold."""
+"""Montagne & Paesi Instagram Bot v2.2.7 - adaptive Meta publishing guard."""
 import html,json,os,re,threading,time,unicodedata
 from datetime import datetime,timedelta
 import requests,feedparser
 from bs4 import BeautifulSoup
 from flask import Flask,request,redirect,jsonify,render_template_string
-APP_VERSION="2.2.6";CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json");LAST_POST_PATH="/data/last_post_meta.txt";STATE_PATH="/data/meta_queue_state.json";GRAPH_BASE="https://graph.instagram.com";DEFAULT_IG_USER_ID="17841409303885274";DEFAULT_RSS="https://www.montagneepaesi.com/feed/";HUB_LINK="www.montagneepaesi.com";PUBLISH_GAP=120;DUPLICATE_TTL=86400;RATE_COOLDOWNS=[1800,3600,7200];META_LIMIT_SUBCODE=2207042;META_LIMIT_RETRY=21600;QUOTA_REFRESH=600
+APP_VERSION="2.2.7";CONFIG_PATH=os.environ.get("CONFIG_PATH","/data/config.json");LAST_POST_PATH="/data/last_post_meta.txt";STATE_PATH="/data/meta_queue_state.json";GRAPH_BASE="https://graph.instagram.com";DEFAULT_IG_USER_ID="17841409303885274";DEFAULT_RSS="https://www.montagneepaesi.com/feed/";HUB_LINK="www.montagneepaesi.com";PUBLISH_GAP=120;DUPLICATE_TTL=86400;RATE_COOLDOWNS=[1800,3600,7200];META_LIMIT_SUBCODE=2207042;QUOTA_REFRESH=600;ADAPTIVE_MARGIN=1
 app=Flask(__name__);logs=[];lock=threading.RLock();store_lock=threading.RLock();stop_event=threading.Event();bot_thread=None;scanner_thread=None
-state={"running":False,"meta_connected":False,"username":"","last_error":"","last_check":"","last_published":"","preview":{},"queue":[],"next_publish_at":0,"meta_diagnostic":"","quota_usage":None,"quota_total":None,"quota_duration":None,"publish_status":""}
+state={"running":False,"meta_connected":False,"username":"","last_error":"","last_check":"","last_published":"","preview":{},"queue":[],"next_publish_at":0,"meta_diagnostic":"","quota_usage":None,"quota_total":None,"quota_duration":None,"publish_status":"","adaptive_limit":None}
 class MetaError(RuntimeError):
  def __init__(self,response,data):
   self.status=response.status_code;self.data=data if isinstance(data,dict) else {};self.error=self.data.get("error") if isinstance(self.data.get("error"),dict) else {};self.headers={k:v for k,v in response.headers.items() if k.lower() in ("x-app-usage","x-page-usage","x-business-use-case-usage","retry-after")};super().__init__(self.error.get("message") or f"Meta API HTTP {self.status}")
@@ -28,7 +28,7 @@ def load_store():
   with open(STATE_PATH,"r",encoding="utf-8") as f:x=json.load(f)
   if not isinstance(x,dict):raise ValueError()
  except Exception:x={}
- for k,v in [("initialized",False),("seen",[]),("queue",[]),("stats",{}),("reports_sent",[]),("title_history",[]),("rate_limit_level",0),("cooldown_until",0),("meta_limit_until",0)]:x.setdefault(k,v)
+ for k,v in [("initialized",False),("seen",[]),("queue",[]),("stats",{}),("reports_sent",[]),("title_history",[]),("rate_limit_level",0),("cooldown_until",0),("adaptive_limit",None),("limit_blocked",False)]:x.setdefault(k,v)
  return x
 def save_store(x):atomic_json(STATE_PATH,x)
 def api(r):
@@ -131,7 +131,7 @@ def set_last(x):
 def stat_inc(s,key):
  day=datetime.now().strftime("%Y-%m-%d");s["stats"].setdefault(day,{"published":0,"errors":0});s["stats"][day][key]=int(s["stats"][day].get(key,0))+1
 def sync_state(s):
- with lock:state["queue"]=[{"title":x.get("title",""),"link":x.get("link","")} for x in s.get("queue",[])]
+ with lock:state["queue"]=[{"title":x.get("title",""),"link":x.get("link","")} for x in s.get("queue",[])];state["adaptive_limit"]=s.get("adaptive_limit")
 def discover(rss):
  items,_=feed_items(rss);links=[x["link"] for x in items]
  with store_lock:
@@ -175,17 +175,27 @@ def scanner_loop(rss,interval):
  scanner_thread=None;log("🔎 Scanner RSS fermo.")
 def loop():
  global bot_thread,scanner_thread
- c=load_config();interval=max(60,int(c.get("check_interval") or 60));token=str(c.get("meta_access_token") or "");uid=str(c.get("meta_ig_user_id") or DEFAULT_IG_USER_ID);rss=str(c.get("rss_url") or DEFAULT_RSS);next_pub=0;next_quota_refresh=0
+ c=load_config();interval=max(60,int(c.get("check_interval") or 60));token=str(c.get("meta_access_token") or "");uid=str(c.get("meta_ig_user_id") or DEFAULT_IG_USER_ID);rss=str(c.get("rss_url") or DEFAULT_RSS);next_pub=0;next_quota_refresh=0;guard_logged=False
  try:
   if not token:raise RuntimeError("Token Meta mancante.")
   m=meta_test(token,uid);state["meta_connected"]=True;state["username"]=str(m.get("username") or "");publishing_limit(token,uid)
-  with store_lock:s=load_store();sync_state(s);next_pub=max(float(s.get("cooldown_until",0)),float(s.get("meta_limit_until",0)))
-  scanner_thread=threading.Thread(target=scanner_loop,args=(rss,interval),daemon=True);scanner_thread.start();log("▶️ Publisher Instagram avviato; una pubblicazione ogni 2 minuti quando Meta consente la pubblicazione.")
+  with store_lock:s=load_store();sync_state(s);next_pub=max(0,float(s.get("cooldown_until",0)))
+  scanner_thread=threading.Thread(target=scanner_loop,args=(rss,interval),daemon=True);scanner_thread.start();log("▶️ Publisher adattivo avviato: 2 minuti tra i post, con guardia automatica sul limite Meta.")
   while not stop_event.is_set():
    now=time.time()
    if now>=next_quota_refresh:publishing_limit(token,uid,True);next_quota_refresh=now+QUOTA_REFRESH
-   with store_lock:s=load_store();prune_history(s);item=s["queue"][0] if s["queue"] else None;hold=float(s.get("meta_limit_until",0));cooldown=float(s.get("cooldown_until",0));sync_state(s)
-   due=max(next_pub,hold,cooldown)
+   with store_lock:s=load_store();prune_history(s);item=s["queue"][0] if s["queue"] else None;cooldown=float(s.get("cooldown_until",0));limit=s.get("adaptive_limit");blocked=bool(s.get("limit_blocked",False));sync_state(s)
+   used=state.get("quota_usage");due=max(next_pub,cooldown)
+   guard=bool(item and limit is not None and used is not None and int(used)>=int(limit))
+   if guard:
+    state["publish_status"]=f"Attesa quota adattiva ({used}/{limit})";state["next_publish_at"]=next_quota_refresh
+    if not guard_logged:log(f"🧠 Guardia adattiva: quota {used}, soglia sicura {limit}. Nessun container creato; controllo sola lettura ogni {QUOTA_REFRESH//60} minuti.");guard_logged=True
+    if stop_event.wait(2):break
+    continue
+   if blocked and limit is not None and used is not None and int(used)<int(limit):
+    with store_lock:s=load_store();s["limit_blocked"]=False;save_store(s)
+    blocked=False;log(f"🟢 Quota scesa a {used}, sotto la soglia adattiva {limit}: pubblicazioni riabilitate.")
+   guard_logged=False
    if item and now>=due:
     with store_lock:
      s=load_store()
@@ -193,21 +203,23 @@ def loop():
     state["publish_status"]="Pubblicazione in corso";log(f"🆕 Pubblicazione dalla coda: {item['title']}")
     try:
      a=build_article(item);state["preview"]=a;mid=publish(token,uid,a)
-     with store_lock:s=load_store();s["queue"]=[x for x in s["queue"] if x.get("link")!=item["link"]];set_last(item["link"]);remember_title(s,item["title"]);stat_inc(s,"published");s["rate_limit_level"]=0;s["cooldown_until"]=0;s["meta_limit_until"]=0;save_store(s);sync_state(s);has_more=bool(s["queue"])
+     with store_lock:s=load_store();s["queue"]=[x for x in s["queue"] if x.get("link")!=item["link"]];set_last(item["link"]);remember_title(s,item["title"]);stat_inc(s,"published");s["rate_limit_level"]=0;s["cooldown_until"]=0;s["limit_blocked"]=False;save_store(s);sync_state(s);has_more=bool(s["queue"])
      state["last_published"]=item["title"];state["last_error"]="";state["publish_status"]="Operativo";log(f"✅ Pubblicato via API Meta. Media ID: {mid}");publishing_limit(token,uid,True);next_pub=time.time()+PUBLISH_GAP;state["next_publish_at"]=next_pub if has_more else 0
     except Exception as e:
      if is_content_publish_limit(e):
-      until=time.time()+META_LIMIT_RETRY
-      with store_lock:s=load_store();s["meta_limit_until"]=until;s["cooldown_until"]=0;save_store(s);sync_state(s)
-      next_pub=until;state["next_publish_at"]=until;state["last_error"]=str(e);state["publish_status"]="Attesa limite Meta";log(f"⛔ Content Publishing Limit Meta (subcode {META_LIMIT_SUBCODE}): nessun nuovo container per {META_LIMIT_RETRY//3600} ore. Coda preservata; scanner RSS attivo.");waha(f"Montagne & Paesi - Limite ufficiale Content Publishing Meta raggiunto. La coda resta salvata e il feed continua a essere letto. Nuovo tentativo automatico tra {META_LIMIT_RETRY//3600} ore.");continue
+      used=state.get("quota_usage")
+      with store_lock:
+       s=load_store();old=s.get("adaptive_limit")
+       learned=max(1,int(used)-ADAPTIVE_MARGIN) if used is not None else (int(old) if old else 49)
+       s["adaptive_limit"]=min(int(old),learned) if old is not None else learned;s["limit_blocked"]=True;s["cooldown_until"]=0;save_store(s);sync_state(s)
+      state["adaptive_limit"]=s["adaptive_limit"];state["last_error"]=str(e);state["publish_status"]=f"Attesa quota adattiva ({used}/{s['adaptive_limit']})";next_quota_refresh=time.time()+QUOTA_REFRESH;state["next_publish_at"]=next_quota_refresh
+      log(f"🧠 Limite Meta appreso: blocco a quota {used}; nuova soglia preventiva {s['adaptive_limit']}. Da ora nessun container finché la quota non scende sotto la soglia.");waha(f"Montagne & Paesi - Limite Meta rilevato a quota {used}. Soglia adattiva impostata a {s['adaptive_limit']}; il bot ripartirà automaticamente appena la quota scende, senza tentativi inutili.");continue
      if is_rate_limit_error(e):
       with store_lock:s=load_store();level=min(int(s.get("rate_limit_level",0)),len(RATE_COOLDOWNS)-1);wait=RATE_COOLDOWNS[level];s["rate_limit_level"]=min(level+1,len(RATE_COOLDOWNS)-1);s["cooldown_until"]=time.time()+wait;save_store(s);sync_state(s);next_pub=s["cooldown_until"]
-      state["next_publish_at"]=next_pub;state["last_error"]=str(e);state["publish_status"]="Cooldown Meta";log(f"⏸️ Limite Meta generico: nuovo tentativo tra {wait//60} minuti.");continue
+      state["next_publish_at"]=next_pub;state["last_error"]=str(e);state["publish_status"]="Cooldown Meta";continue
      with store_lock:s=load_store();stat_inc(s,"errors");save_store(s)
      raise
-   elif item:
-    state["next_publish_at"]=due
-    if hold>now:state["publish_status"]="Attesa limite Meta"
+   elif item:state["next_publish_at"]=due
    else:state["next_publish_at"]=0;state["publish_status"]="In attesa di articoli"
    if stop_event.wait(2):break
  except Exception as e:state["last_error"]=str(e);log(f"🛑 Bot fermato per errore: {e}");stop_event.set();waha(f"Montagne & Paesi - Instagram Bot fermato per errore: {e}")
@@ -221,7 +233,7 @@ def formcfg():
  try:c["check_interval"]=max(60,int(request.form.get("check_interval","") or c.get("check_interval") or 60))
  except Exception:c["check_interval"]=60
  return c
-PAGE='''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>M&P Instagram Bot</title><style>body{font-family:Arial;background:#f5f6f8;padding:20px}.box{max-width:950px;margin:auto;background:#fff;padding:22px;border-radius:12px}input{width:100%;box-sizing:border-box;padding:9px;margin:4px 0 10px}.btn{padding:10px 14px;margin:4px;border:0;border-radius:7px}.start{background:#16803b;color:#fff}.stop{background:#b42318;color:#fff}.blue{background:#1769e0;color:#fff}.danger{background:#8b0000;color:#fff}.card{padding:12px;background:#f7f7f7;border-radius:8px;margin-top:14px}pre{background:#111;color:#eee;padding:12px;max-height:420px;overflow:auto;white-space:pre-wrap}.small{font-size:13px;color:#666}#queue li{margin:7px 0}</style></head><body><div class="box"><h2>Montagne & Paesi → Instagram Bot</h2><div class="small">Versione <b>{{v}}</b> • API ufficiale Meta</div><form method="post"><h3>Instagram</h3><label>Instagram User ID</label><input name="meta_ig_user_id" value="{{uid}}"><label>Access Token Meta</label><input type="password" name="meta_access_token" placeholder="{% if token %}Token salvato{% else %}Token non configurato{% endif %}"><label>Feed RSS</label><input name="rss_url" value="{{rss}}"><label>Intervallo controllo feed (secondi)</label><input name="check_interval" value="{{interval}}"><h3>WhatsApp WAHA</h3><label>WAHA URL</label><input name="waha_url" value="{{wu}}"><label>Sessione</label><input name="waha_session" value="{{ws}}"><label>Numero destinatario</label><input name="waha_number" value="{{wn}}"><label>WAHA API Key</label><input type="password" name="waha_api_key" placeholder="{% if wk %}API Key salvata{% else %}API Key non configurata{% endif %}"><button class="btn blue" formaction="/save">Salva</button><button class="btn blue" formaction="/preview">Anteprima</button><button class="btn blue" formaction="/test_waha">Test WAHA</button><button class="btn start" formaction="/start">Avvia bot</button><button class="btn stop" formaction="/stop">Ferma bot</button></form><div class="card"><b>Stato:</b> <span id="st"></span><br><b>Pubblicazione:</b> <span id="pstatus">-</span><br><b>Quota Meta (informativa):</b> <span id="quota">-</span><br><span id="countdown" class="small"></span><br><span id="diag" class="small"></span></div><div class="card"><b>Coda — <span id="qcount">0</span></b> <button class="btn danger" onclick="clearQueue()">Cancella coda</button><ol id="queue"></ol></div>{% if preview %}<div class="card" style="white-space:pre-wrap"><b>Anteprima</b>\n\n{{preview.caption}}</div>{% endif %}<h3>Log</h3><button class="btn" onclick="copyLog()">Copia log</button><button class="btn" onclick="clearLog()">Azzera log</button><pre id="log"></pre><script>async function refresh(){let s=await(await fetch('/status')).json();st.textContent=s.running?'ATTIVO':'FERMO';pstatus.textContent=s.publish_status||'-';quota.textContent=(s.quota_usage==null||s.quota_total==null)?'-':s.quota_usage+' / '+s.quota_total;let q=s.queue||[];qcount.textContent=q.length;queue.innerHTML='';q.forEach(x=>{let li=document.createElement('li');li.textContent=x.title;queue.appendChild(li)});let sec=s.next_publish_in||0;countdown.textContent=q.length&&sec>0?'Prossimo tentativo tra '+Math.ceil(sec/60)+' minuti':'';diag.textContent=s.meta_diagnostic?'Ultima diagnostica Meta: '+s.meta_diagnostic:'';log.textContent=await(await fetch('/logs')).text()}async function clearQueue(){if(confirm('Cancellare tutti gli articoli attualmente in coda?')){await fetch('/clear_queue',{method:'POST'});refresh()}}async function copyLog(){await navigator.clipboard.writeText(log.textContent)}async function clearLog(){await fetch('/clear_logs',{method:'POST'});refresh()}setInterval(refresh,2500);refresh()</script></div></body></html>'''
+PAGE='''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>M&P Instagram Bot</title><style>body{font-family:Arial;background:#f5f6f8;padding:20px}.box{max-width:950px;margin:auto;background:#fff;padding:22px;border-radius:12px}input{width:100%;box-sizing:border-box;padding:9px;margin:4px 0 10px}.btn{padding:10px 14px;margin:4px;border:0;border-radius:7px}.start{background:#16803b;color:#fff}.stop{background:#b42318;color:#fff}.blue{background:#1769e0;color:#fff}.danger{background:#8b0000;color:#fff}.card{padding:12px;background:#f7f7f7;border-radius:8px;margin-top:14px}pre{background:#111;color:#eee;padding:12px;max-height:420px;overflow:auto;white-space:pre-wrap}.small{font-size:13px;color:#666}#queue li{margin:7px 0}</style></head><body><div class="box"><h2>Montagne & Paesi → Instagram Bot</h2><div class="small">Versione <b>{{v}}</b> • API ufficiale Meta</div><form method="post"><h3>Instagram</h3><label>Instagram User ID</label><input name="meta_ig_user_id" value="{{uid}}"><label>Access Token Meta</label><input type="password" name="meta_access_token" placeholder="{% if token %}Token salvato{% else %}Token non configurato{% endif %}"><label>Feed RSS</label><input name="rss_url" value="{{rss}}"><label>Intervallo controllo feed (secondi)</label><input name="check_interval" value="{{interval}}"><h3>WhatsApp WAHA</h3><label>WAHA URL</label><input name="waha_url" value="{{wu}}"><label>Sessione</label><input name="waha_session" value="{{ws}}"><label>Numero destinatario</label><input name="waha_number" value="{{wn}}"><label>WAHA API Key</label><input type="password" name="waha_api_key" placeholder="{% if wk %}API Key salvata{% else %}API Key non configurata{% endif %}"><button class="btn blue" formaction="/save">Salva</button><button class="btn blue" formaction="/preview">Anteprima</button><button class="btn blue" formaction="/test_waha">Test WAHA</button><button class="btn start" formaction="/start">Avvia bot</button><button class="btn stop" formaction="/stop">Ferma bot</button></form><div class="card"><b>Stato:</b> <span id="st"></span><br><b>Pubblicazione:</b> <span id="pstatus">-</span><br><b>Quota Meta:</b> <span id="quota">-</span><br><b>Soglia adattiva:</b> <span id="adaptive">-</span><br><span id="countdown" class="small"></span><br><span id="diag" class="small"></span></div><div class="card"><b>Coda — <span id="qcount">0</span></b> <button class="btn danger" onclick="clearQueue()">Cancella coda</button><ol id="queue"></ol></div>{% if preview %}<div class="card" style="white-space:pre-wrap"><b>Anteprima</b>\n\n{{preview.caption}}</div>{% endif %}<h3>Log</h3><button class="btn" id="copybtn" onclick="copyLog()">Copia log</button><button class="btn" onclick="clearLog()">Azzera log</button><pre id="log"></pre><script>async function refresh(){let s=await(await fetch('/status')).json();st.textContent=s.running?'ATTIVO':'FERMO';pstatus.textContent=s.publish_status||'-';quota.textContent=(s.quota_usage==null||s.quota_total==null)?'-':s.quota_usage+' / '+s.quota_total;adaptive.textContent=s.adaptive_limit==null?'In apprendimento':s.adaptive_limit;let q=s.queue||[];qcount.textContent=q.length;queue.innerHTML='';q.forEach(x=>{let li=document.createElement('li');li.textContent=x.title;queue.appendChild(li)});let sec=s.next_publish_in||0;countdown.textContent=q.length&&sec>0?'Prossimo controllo/tentativo tra '+Math.ceil(sec/60)+' minuti':'';diag.textContent=s.meta_diagnostic?'Ultima diagnostica Meta: '+s.meta_diagnostic:'';log.textContent=await(await fetch('/logs')).text()}async function clearQueue(){if(confirm('Cancellare tutti gli articoli attualmente in coda?')){await fetch('/clear_queue',{method:'POST'});refresh()}}async function copyLog(){let txt=document.getElementById('log').textContent,b=document.getElementById('copybtn');try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(txt)}else{let t=document.createElement('textarea');t.value=txt;t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);t.focus();t.select();t.setSelectionRange(0,t.value.length);if(!document.execCommand('copy'))throw new Error('copy');document.body.removeChild(t)}b.textContent='Copiato!';setTimeout(()=>b.textContent='Copia log',1500)}catch(e){window.prompt('Copia manualmente il log:',txt)}}async function clearLog(){await fetch('/clear_logs',{method:'POST'});refresh()}setInterval(refresh,2500);refresh()</script></div></body></html>'''
 @app.get("/")
 def home():
  c=load_config();return render_template_string(PAGE,v=APP_VERSION,uid=html.escape(str(c.get("meta_ig_user_id") or DEFAULT_IG_USER_ID)),rss=html.escape(str(c.get("rss_url") or DEFAULT_RSS)),interval=c.get("check_interval",60),token=bool(c.get("meta_access_token")),wu=html.escape(str(c.get("waha_url") or "")),ws=html.escape(str(c.get("waha_session") or "default")),wn=html.escape(str(c.get("waha_number") or "")),wk=bool(c.get("waha_api_key")),preview=state["preview"])
@@ -247,7 +259,7 @@ def clear_queue():
  with lock:state["next_publish_at"]=0
  log(f"🗑️ Coda cancellata manualmente: rimossi {n} articoli.");return jsonify({"ok":True,"removed":n})
 @app.post("/test_waha")
-def test_waha():save_config(formcfg());waha("Test Montagne & Paesi: Instagram Bot v2.2.6 funzionante.");return redirect("/")
+def test_waha():save_config(formcfg());waha("Test Montagne & Paesi: Instagram Bot v2.2.7 funzionante.");return redirect("/")
 @app.get("/status")
 def status():
  with lock:d={k:v for k,v in state.items() if k!="preview"};d["queue"]=list(state["queue"]);d["version"]=APP_VERSION;d["next_publish_in"]=max(0,int(state["next_publish_at"]-time.time()+.999)) if state["next_publish_at"] else 0
@@ -260,4 +272,4 @@ def clearlogs():
  with lock:logs.clear()
  return jsonify({"ok":True})
 threading.Thread(target=report_loop,daemon=True).start()
-if __name__=="__main__":log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🛡️ Gestione persistente Content Publishing Limit Meta attiva.");app.run(host="0.0.0.0",port=8080)
+if __name__=="__main__":log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");log("🧠 Guardia adattiva Content Publishing Meta attiva.");app.run(host="0.0.0.0",port=8080)

@@ -1,18 +1,13 @@
-"""Montagne & Paesi Instagram Bot v2.3.2 - smart queue, resilient fetch, precise hashtags."""
-import re,time
+"""Montagne & Paesi Instagram Bot v2.3.3 - smart queue, resilient fetch, semantic hashtags."""
+import re,time,unicodedata
 import feedparser
 import meta_v2 as core
 
-APP_VERSION="2.3.2"
-MAX_AGE_HOURS=18
-MAX_QUEUE=60
-FETCH_RETRY=300
-
+APP_VERSION="2.3.3";MAX_AGE_HOURS=18;MAX_QUEUE=60;FETCH_RETRY=300
 EXCLUDE_PATTERNS=[r"\boroscopo\b",r"\bbenzina\b.*\bdiesel\b",r"\bprezzi (?:del|carburanti)\b",r"\bfisco\b",r"\b730\b",r"\bsenato\b",r"\bcamera dei deputati\b",r"\bgoverno\b",r"\bmeloni\b",r"\bemmy\b",r"\bwall street\b",r"\bborse? europee\b",r"\bspread\b",r"\bmercati azionari\b"]
 LOCAL_TERMS=["bergamo","brescia","clusone","gandino","albino","ardesio","darfo","boario","val seriana","valseriana","val brembana","valbrembana","val camonica","valcamonica","valtrompia","franciacorta","iseo","lovere","pisogne","sarnico","sovere","pianico","rovetta","castione","presolana","schilpario","vilminore","colere","onore","songavazzo","fino del monte","ponte nossa","vertova","casnigo","leffe","nembro","alzano","seriate","treviglio","romano di lombardia","sirmione","desenzano","garda","orobie","lombardia"]
 URGENT_TERMS=["incidente","schianto","mortale","morto","deceduto","ferito","elisoccorso","incendio","maltempo","temporale","frana","alluvione","caduta massi","strada chiusa","chiusura","rapina","arrestato","arresti","scomparso","disperso","soccorso","vigili del fuoco"]
 SOCIAL_TERMS=["evento","festa","festival","concerto","sport","campion","oro","gara","mostra","foto","video","cervo","orso","lupo","montagna","alpeggio","rifugio","sagra"]
-
 def norm(x):return re.sub(r"\s+"," ",core.clean(x)).strip().lower()
 def excluded(title):
  t=norm(title)
@@ -43,7 +38,6 @@ def prune_and_rank(s):
  kept.sort(key=lambda x:(-int(x.get("priority",0)),-float(x.get("added_at",0))))
  if len(kept)>MAX_QUEUE:dropped+=len(kept)-MAX_QUEUE;kept=kept[:MAX_QUEUE]
  s["queue"]=kept;return dropped
-
 def smart_discover(rss):
  f=feedparser.parse(rss)
  if not f.entries:raise RuntimeError("Nessun articolo disponibile nel feed RSS.")
@@ -69,36 +63,31 @@ def smart_discover(rss):
   if added:core.log(f"🧠 Coda intelligente: aggiunti {added} articoli. Totale: {len(s['queue'])}.")
 
 def richer_hashtags(title,body):
- text=norm(title+" "+body);tags=[]
+ raw=core.clean(title+" "+body);text=norm(raw);tags=[]
  def add(tag):
-  tag=re.sub(r"[^A-Za-z0-9]","",tag)
-  if tag and tag.lower() not in {x.lower() for x in tags}:tags.append(tag)
- def matches(patterns):return any(re.search(p,text,re.I) for p in patterns)
- places={"bergamo":["Bergamo","Bergamasca","Lombardia"],"brescia":["Brescia","Bresciano","Lombardia"],"clusone":["Clusone","ValSeriana","Orobie"],"gandino":["Gandino","ValGandino","ValSeriana"],"fino del monte":["FinoDelMonte","ValSeriana","Orobie"],"val seriana":["ValSeriana","Orobie","Bergamo"],"valseriana":["ValSeriana","Orobie","Bergamo"],"val brembana":["ValBrembana","Orobie","Bergamo"],"valcamonica":["ValCamonica","Brescia","Lombardia"],"val camonica":["ValCamonica","Brescia","Lombardia"],"franciacorta":["Franciacorta","Brescia","Lombardia"],"iseo":["Iseo","LagoDIseo","Brescia"]}
- for key,vals in places.items():
-  if re.search(r"(?<!\w)"+re.escape(key)+r"(?!\w)",text):
+  tag=unicodedata.normalize("NFKD",tag).encode("ascii","ignore").decode();tag=re.sub(r"[^A-Za-z0-9]","",tag)
+  if len(tag)>=3 and tag.lower() not in {x.lower() for x in tags}:tags.append(tag)
+ def has(p):return bool(re.search(p,text,re.I))
+ # Localita e aree: sempre hashtag composti, mai parole spezzate come #Busto #Arsizio.
+ geo=[(r"\bbusto arsizio\b",["BustoArsizio","Varese","Lombardia"]),(r"\bvarese\b",["Varese","Lombardia"]),(r"\bbergamo\b",["Bergamo","Bergamasca","Lombardia"]),(r"\bbrescia\b",["Brescia","Bresciano","Lombardia"]),(r"\bfino del monte\b",["FinoDelMonte","ValSeriana","Orobie"]),(r"\bclusone\b",["Clusone","ValSeriana","Orobie"]),(r"\bgandino\b",["Gandino","ValGandino","ValSeriana"]),(r"\bval ?seriana\b",["ValSeriana","Orobie","Bergamo"]),(r"\bval ?brembana\b",["ValBrembana","Orobie","Bergamo"]),(r"\bval ?camonica\b",["ValCamonica","Brescia","Lombardia"]),(r"\bfranciacorta\b",["Franciacorta","Brescia","Lombardia"]),(r"\biseo\b",["Iseo","LagoDIseo","Brescia"]),(r"\borobie\b",["Orobie","Montagna","Lombardia"])]
+ for p,vals in geo:
+  if has(p):
    for v in vals:add(v)
- topics=[
-  ([r"\bincidente\b",r"\bschianto\b"],["Incidente","Cronaca","SicurezzaStradale"]),
-  ([r"\barrest\w*\b",r"\bdenunc\w*\b",r"\bspaccio\b",r"\bdroga\b"],["Cronaca","Carabinieri","Sicurezza"]),
-  ([r"\bmaltempo\b",r"\btemporale\w*\b",r"\bfrana\b",r"\balluvion\w*\b"],["Maltempo","Meteo","Territorio"]),
-  ([r"\bincendio\b",r"\bvigili del fuoco\b"],["Incendio","VigiliDelFuoco","Cronaca"]),
-  ([r"\bevento\b",r"\bfesta\b",r"\bfestival\b",r"\bsagra\b"],["Eventi","Territorio","Cultura"]),
-  ([r"\bsport\b",r"\bsportivo\b",r"\bsportiva\b",r"\bsportivi\b",r"\bsportive\b",r"\bgara\b",r"\bgare\b",r"\bcampion(?:e|essa|i|esse|ato|ati|ati|ati)\b",r"\btorneo\b",r"\bcoppa\b",r"\bcup\b"],["Sport","SportLocale","Territorio"]),
-  ([r"\bmontagna\b",r"\borobie\b",r"\brifugio\b",r"\balpeggio\b"],["Montagna","Orobie","Natura"]),
-  ([r"\bcomune\b",r"\bsindaco\b",r"\bamministrazione\b"],["Comuni","Territorio","PoliticaLocale"]),
-  ([r"\bscuola\b",r"\buniversit\w*\b",r"\bunibg\b"],["Scuola","Universita","Bergamo"]),
-  ([r"\baeroporto\b",r"\borio al serio\b"],["Aeroporto","OrioAlSerio","Bergamo"])]
- for patterns,vals in topics:
-  if matches(patterns):
+ # Eventi/nome proprio riconoscibili: frasi complete e hashtag utili.
+ named=[(r"\btre valli varesine(?: women's race| women.?s race)?\b",["TreValliVaresine"]),(r"\borobie cup(?: junior)?\b",["OrobieCup"]),(r"\b(?:universita|università) (?:degli studi )?di bergamo\b|\bunibg\b",["UniBg"])]
+ for p,vals in named:
+  if has(p):
    for v in vals:add(v)
- stop={"della","delle","degli","dello","alla","alle","agli","allo","nella","nelle","negli","nello","dalla","dalle","dagli","dallo","come","contro","dopo","prima","nuovo","nuova","anni","oggi","ieri","domani","grande","spazio","mondo","citta","centro"}
- for w in re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'-]{3,}",core.clean(title)):
-  if w.lower() not in stop and w[:1].isupper():add(w)
-  if len(tags)>=11:break
+ # Temi specifici. Non vengono aggiunte categorie non supportate dal testo.
+ themes=[(r"\bciclism\w*\b",["Ciclismo","CiclismoItaliano"]),(r"\bciclism\w*\b.*\b(?:donn|femminil)\w*\b|\b(?:donn|femminil)\w*\b.*\bciclism\w*\b",["CiclismoFemminile"]),(r"\b(?:sport|sportiv[oaie]|gara|gare|campionat[oi]|campion[ei]|campionessa|campionesse|torneo|coppa|cup)\b",["Sport"]),(r"\bincidente\b|\bschianto\b",["Cronaca","Incidente","SicurezzaStradale"]),(r"\barrest\w*\b|\bdenunc\w*\b|\bspaccio\b|\bdroga\b",["Cronaca","Sicurezza"]),(r"\bmaltempo\b|\btemporale\w*\b|\bfrana\b|\balluvion\w*\b",["Maltempo","Meteo"]),(r"\bincendio\b|\bvigili del fuoco\b",["Cronaca","VigiliDelFuoco"]),(r"\bfesta\b|\bfestival\b|\bsagra\b|\bmanifestazione\b",["Eventi"]),(r"\bmontagna\b|\brifugio\b|\balpeggio\b",["Montagna","Natura"]),(r"\baeroporto\b|\borio al serio\b",["Aeroporto","OrioAlSerio"])]
+ for p,vals in themes:
+  if has(p):
+   for v in vals:add(v)
+ # Evento sportivo solo se sono presenti sia un evento/gara sia un riferimento sportivo reale.
+ if has(r"\b(?:gara|gare|campionato|torneo|coppa|cup|race|manifestazione)\b") and has(r"\b(?:sport|sportiv[oaie]|ciclism\w*|calcio|basket|pallavolo|sci|atletica|nuoto)\b"):add("EventiSportivi")
+ # Hashtag editoriali di contesto solo quando coerenti; nessuna estrazione cieca delle maiuscole dal titolo.
+ if any(has(p) for p in [r"\bbergamo\b",r"\bbrescia\b",r"\bvarese\b",r"\bval ?seriana\b",r"\bval ?brembana\b",r"\bval ?camonica\b",r"\blombardia\b"]):add("NotizieLocali")
  add("MontagneEPaesi")
- for x in ["NotizieLocali","Territorio","Lombardia"]:
-  if len(tags)<8:add(x)
  return " ".join("#"+x for x in tags[:12])
 core.smart_hashtags=richer_hashtags
 
@@ -109,16 +98,11 @@ def resilient_build(item,entry=None):
 core.build_article=resilient_build
 _original_rate=core.is_rate_limit_error
 def retryable_error(e):return str(e).startswith("TEMP_FETCH:") or _original_rate(e)
-core.is_rate_limit_error=retryable_error
-core.RATE_COOLDOWNS=[FETCH_RETRY,FETCH_RETRY,FETCH_RETRY]
-core.discover=smart_discover
-core.APP_VERSION=APP_VERSION
+core.is_rate_limit_error=retryable_error;core.RATE_COOLDOWNS=[FETCH_RETRY,FETCH_RETRY,FETCH_RETRY];core.discover=smart_discover;core.APP_VERSION=APP_VERSION
 try:
  with core.store_lock:
   s=core.load_store();removed=prune_and_rank(s);core.save_store(s);core.sync_state(s)
- if removed:core.log(f"🧹 Migrazione coda v2.3.2: rimossi {removed} articoli automatici/vecchi.")
+ if removed:core.log(f"🧹 Migrazione coda v2.3.3: rimossi {removed} articoli automatici/vecchi.")
 except Exception as e:core.log(f"⚠️ Migrazione coda intelligente non riuscita: {e}")
 if __name__=="__main__":
- core.log(f"🟢 Web UI pronta. Versione {APP_VERSION}.")
- core.log("🧠 Hashtag con corrispondenza precisa + retry automatico + coda intelligente attivi.")
- core.app.run(host="0.0.0.0",port=8080)
+ core.log(f"🟢 Web UI pronta. Versione {APP_VERSION}.");core.log("🧠 Hashtag semantici/composti + retry automatico + coda intelligente attivi.");core.app.run(host="0.0.0.0",port=8080)

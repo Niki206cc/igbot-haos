@@ -7,22 +7,14 @@ import meta_v2 as core
 APP_VERSION = "2.4.0"
 PROBE_INTERVAL = 3 * 3600
 FIRST_PROBE_DELAY = 120
+PROBE_TIMEOUT = 600
 
-# La coda intelligente resta ordinata per priorita/freschezza, ma durante blocchi lunghi
-# conserva fino a 150 articoli invece di sacrificarli gia a quota 60.
 smart.MAX_QUEUE = 150
 core.APP_VERSION = APP_VERSION
 
 
 def probe_guard_loop():
-    """Sblocca un solo probe controllato se il contatore Meta resta fermo.
-
-    Il core continua a usare quota_usage e la soglia adattiva. Quando Meta dichiara
-    ancora una quota bloccante per ore, questo watchdog consente un tentativo reale.
-    Se Meta risponde ancora 2207042, il core reimpara la soglia e il prossimo probe
-    viene rinviato. Se il tentativo riesce, il publisher puo riprendere normalmente
-    fino a un eventuale nuovo blocco reale.
-    """
+    """Consente un singolo tentativo reale quando quota_usage resta bloccato."""
     while True:
         try:
             now = time.time()
@@ -34,52 +26,64 @@ def probe_guard_loop():
                 probe_after = float(s.get("probe_after", 0) or 0)
                 probe_active = bool(s.get("probe_active", False))
 
-                if blocked and limit is not None and queue:
+                if blocked and limit is not None and queue and not probe_active:
                     if probe_after <= 0:
-                        # Al primo avvio della 2.4.0 non aspettiamo altre ore: il blocco
-                        # puo essere gia vecchio. Facciamo il primo probe dopo 2 minuti.
                         s["probe_after"] = now + FIRST_PROBE_DELAY
-                        s["probe_active"] = False
                         core.save_store(s)
                         core.log("🧪 Probe Meta programmato: primo tentativo controllato tra 2 minuti se la quota resta bloccata.")
-                    elif now >= probe_after and not probe_active:
+                    elif now >= probe_after:
                         old_limit = int(limit)
                         s["probe_previous_limit"] = old_limit
                         s["probe_active"] = True
                         s["probe_started_at"] = now
+                        s["probe_last_published"] = str(core.state.get("last_published") or "")
                         s["probe_after"] = now + PROBE_INTERVAL
-                        # Disabilita temporaneamente la guardia: il core fara UN tentativo.
-                        # Se fallisce con 2207042, il core rimette subito adaptive_limit.
+                        # Apre temporaneamente la guardia. Il publisher effettua il tentativo
+                        # sulla testa della coda; un nuovo 2207042 ripristina subito la soglia.
                         s["adaptive_limit"] = None
                         s["limit_blocked"] = False
                         s["cooldown_until"] = 0
                         core.save_store(s)
                         core.sync_state(s)
-                        core.log(f"🧪 Probe Meta: quota ancora bloccata alla soglia {old_limit}. Autorizzato un tentativo reale controllato.")
+                        core.log(f"🧪 Probe Meta: quota ancora bloccata alla soglia {old_limit}. Autorizzato un solo tentativo reale.")
+
                 elif probe_active:
-                    # Se dopo il probe il core ha rimesso limit_blocked=True significa
-                    # che Meta ha rifiutato di nuovo. Se invece resta False, il probe e
-                    # riuscito e lasciamo proseguire normalmente.
+                    previous = str(s.get("probe_last_published") or "")
+                    current = str(core.state.get("last_published") or "")
+                    started = float(s.get("probe_started_at", now))
+
                     if blocked:
+                        # Il tentativo ha ricevuto nuovamente 2207042.
                         s["probe_active"] = False
                         s["probe_after"] = now + PROBE_INTERVAL
                         core.save_store(s)
-                        core.log(f"⏳ Probe Meta ancora bloccato: nuovo tentativo non prima di {PROBE_INTERVAL//3600} ore.")
-                    elif now - float(s.get("probe_started_at", now)) > 180:
+                        core.log(f"⏳ Probe Meta ancora bloccato: nuovo probe tra {PROBE_INTERVAL//3600} ore.")
+                    elif current and current != previous:
+                        # Almeno un post e stato pubblicato: Meta ha riaperto davvero.
                         s["probe_active"] = False
                         s["probe_after"] = 0
                         core.save_store(s)
-                        core.log("🟢 Probe Meta riuscito: pubblicazioni normali riabilitate.")
-                elif not blocked and probe_after:
+                        core.log("🟢 Probe Meta riuscito: pubblicazione confermata, flusso normale riabilitato.")
+                    elif now - started >= PROBE_TIMEOUT:
+                        # Nessuna conferma entro 10 minuti (es. timeout sito): richiude la
+                        # guardia invece di lasciare tentativi liberi.
+                        old = int(s.get("probe_previous_limit") or 49)
+                        s["adaptive_limit"] = old
+                        s["limit_blocked"] = True
+                        s["probe_active"] = False
+                        s["probe_after"] = now + PROBE_INTERVAL
+                        core.save_store(s)
+                        core.sync_state(s)
+                        core.log(f"⏳ Probe Meta senza esito entro {PROBE_TIMEOUT//60} minuti: guardia ripristinata a {old}, nuovo probe tra {PROBE_INTERVAL//3600} ore.")
+
+                elif not blocked and probe_after and not probe_active:
                     s["probe_after"] = 0
-                    s["probe_active"] = False
                     core.save_store(s)
         except Exception as e:
             core.log(f"⚠️ Watchdog probe Meta: {e}")
         time.sleep(15)
 
 
-# Ripulisce/riordina subito la coda con il nuovo limite 150 senza cancellare gli articoli esistenti.
 try:
     with core.store_lock:
         s = core.load_store()

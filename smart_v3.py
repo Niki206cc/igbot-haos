@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.5.4 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.6.0 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import threading
 import time
@@ -11,7 +11,7 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.6.0"
 PROBE_INTERVAL = 60
 FIRST_PROBE_DELAY = 60
 PROBE_TIMEOUT = 180
@@ -110,7 +110,7 @@ core.build_article=resilient_build
 _original_rate=core.is_rate_limit_error
 def keep_alive_error(e):
     t=str(e)
-    return t.startswith("SKIP_MEDIA_INVALID:") or t.startswith("TEMP_IMAGE_MISSING:") or _original_rate(e)
+    return t.startswith("SKIP_MEDIA_INVALID:") or t.startswith("TEMP_IMAGE_MISSING:") or t.startswith("MEDIA_PRECHECK_INVALID:") or t.startswith("MEDIA_PRECHECK_TEMP:") or _original_rate(e)
 core.is_rate_limit_error=keep_alive_error
 
 def media_queue_watchdog():
@@ -118,14 +118,14 @@ def media_queue_watchdog():
     while True:
         try:
             err=str(core.state.get("last_error") or "")
-            if err.startswith("SKIP_MEDIA_INVALID:") and err!=last_seen:
+            if (err.startswith("SKIP_MEDIA_INVALID:") or err.startswith("MEDIA_PRECHECK_INVALID:")) and err!=last_seen:
                 last_seen=err
                 with core.store_lock:
                     s=core.load_store()
                     if s.get("queue"):
                         bad=s["queue"].pop(0);core.save_store(s);core.sync_state(s);core.log(f"⏭️ Media non compatibile con Instagram: articolo saltato senza fermare il bot: {bad.get('title','')}");core.waha("⚠️ Instagram: articolo saltato perché il media non è compatibile.\n\n"+str(bad.get("title") or ""))
                     s=core.load_store();s["cooldown_until"]=0;s["rate_limit_level"]=0;core.save_store(s);core.sync_state(s)
-            elif err.startswith("TEMP_IMAGE_MISSING:") and err!=last_seen:
+            elif (err.startswith("TEMP_IMAGE_MISSING:") or err.startswith("MEDIA_PRECHECK_TEMP:")) and err!=last_seen:
                 last_seen=err
                 # Sposta in fondo alla coda: potrà essere riprovato più tardi senza bloccare gli altri.
                 with core.store_lock:
@@ -239,5 +239,5 @@ if __name__=="__main__":
     core.log("🌙 A mezzanotte la coda residua viene ridotta automaticamente ai primi 5 articoli prioritari.")
     core.log("🧪 Alla soglia Meta: un probe reale ogni 1 minuto, senza disattivare le protezioni.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
-    core.log("🖼️ Errori media isolati: immagine mancante riprovata fino a 3 volte; aspect ratio/media type non validi saltano solo il singolo articolo.")
+    core.log("🖼️ Pre-controllo Meta: solo JPEG pubblico; errori temporanei riprovati fino a 3 volte, media non validi saltano il singolo articolo.")
     core.app.run(host="0.0.0.0",port=8080)

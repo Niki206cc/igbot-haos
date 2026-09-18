@@ -1,26 +1,29 @@
-"""Montagne & Paesi Instagram Bot v2.5.0 - adaptive speed, manual queue controls, Meta probe."""
+"""Montagne & Paesi Instagram Bot v2.5.1 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+import os
 import threading
 import time
 import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.5.0"
-PROBE_INTERVAL = 3 * 3600
+APP_VERSION = "2.5.1"
+PROBE_INTERVAL = 15 * 60
 FIRST_PROBE_DELAY = 120
-PROBE_TIMEOUT = 600
+PROBE_TIMEOUT = 180
 NORMAL_GAP = 90
 BUSY_GAP = 60
 BUSY_QUEUE = 50
+
+# Forza l'ora italiana anche se il container parte in UTC.
+os.environ["TZ"] = "Europe/Rome"
+if hasattr(time, "tzset"):
+    time.tzset()
 
 smart.MAX_QUEUE = 150
 core.APP_VERSION = APP_VERSION
 core.PUBLISH_GAP = NORMAL_GAP
 
 # --- Ordine manuale persistente -------------------------------------------------
-# Quando l'utente riordina la coda, assegniamo manual_rank a tutti gli elementi.
-# Il ranking automatico continua a funzionare finche la coda non viene modificata
-# manualmente; in seguito i nuovi articoli vengono accodati dopo quelli ordinati.
 _original_prune = smart.prune_and_rank
 def manual_aware_prune(s):
     dropped = _original_prune(s)
@@ -31,11 +34,9 @@ def manual_aware_prune(s):
     return dropped
 smart.prune_and_rank = manual_aware_prune
 
-
 def save_manual_order(q):
     for i, x in enumerate(q):
         x["manual_rank"] = i
-
 
 @core.app.post("/queue_move")
 def queue_move():
@@ -55,7 +56,6 @@ def queue_move():
         save_manual_order(q);s["queue"]=q;core.save_store(s);core.sync_state(s)
     return jsonify({"ok":True})
 
-
 @core.app.post("/queue_delete")
 def queue_delete():
     data=request.get_json(silent=True) or {};links=set(str(x) for x in data.get("links",[]) if x)
@@ -65,10 +65,7 @@ def queue_delete():
     core.log(f"🗑️ Rimossi manualmente {removed} articoli dalla coda.")
     return jsonify({"ok":True,"removed":removed})
 
-
 # --- UI coda -------------------------------------------------------------------
-# Sostituisce solo il rendering JS della lista e aggiunge i controlli, senza
-# duplicare il pannello/configurazione del core.
 core.PAGE = core.PAGE.replace(
     '<b>Coda — <span id="qcount">0</span></b> <button class="btn danger" onclick="clearQueue()">Cancella coda</button>',
     '<b>Coda — <span id="qcount">0</span></b> <button class="btn danger" onclick="deleteSelected()">Elimina selezionati</button> <button class="btn danger" onclick="clearQueue()">Cancella coda</button><div class="small">★ porta subito in cima • ↑/↓ cambia priorità • seleziona più articoli e usa Elimina selezionati</div>'
@@ -82,7 +79,7 @@ core.PAGE = core.PAGE.replace(
     "async function moveQueue(link,action){await fetch('/queue_move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({link:link,action:action})});refresh()}async function deleteLinks(links){if(!links.length)return;if(confirm('Rimuovere dalla coda '+links.length+' articoli?')){await fetch('/queue_delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({links:links})});refresh()}}async function deleteSelected(){let links=[...document.querySelectorAll('.qsel:checked')].map(x=>x.value);if(!links.length){alert('Seleziona almeno un articolo.');return}deleteLinks(links)}async function clearQueue()"
 )
 
-# --- Aspect ratio non fatale ----------------------------------------------------
+# --- Errori media non fatali ----------------------------------------------------
 def is_unsupported_media_error(e):
     text=str(e).lower()
     if isinstance(e,core.MetaError):
@@ -98,12 +95,24 @@ def resilient_publish(token,user_id,article):
         if is_unsupported_media_error(e):raise RuntimeError("SKIP_MEDIA_ASPECT: "+str(e))
         raise
 core.publish=resilient_publish
+
+# Immagine assente: problema del singolo articolo, mai arrestare tutto il bot.
+_original_build=core.build_article
+def resilient_build(item,entry=None):
+    try:return _original_build(item,entry)
+    except Exception as e:
+        if "immagine in evidenza pubblica non trovata" in str(e).lower():
+            raise RuntimeError("TEMP_IMAGE_MISSING: "+str(e))
+        raise
+core.build_article=resilient_build
+
 _original_rate=core.is_rate_limit_error
-def keep_alive_error(e):return str(e).startswith("SKIP_MEDIA_ASPECT:") or _original_rate(e)
+def keep_alive_error(e):
+    t=str(e)
+    return t.startswith("SKIP_MEDIA_ASPECT:") or t.startswith("TEMP_IMAGE_MISSING:") or _original_rate(e)
 core.is_rate_limit_error=keep_alive_error
 
-
-def bad_media_queue_watchdog():
+def media_queue_watchdog():
     last_seen=""
     while True:
         try:
@@ -115,11 +124,23 @@ def bad_media_queue_watchdog():
                     if s.get("queue"):
                         bad=s["queue"].pop(0);core.save_store(s);core.sync_state(s);core.log(f"⏭️ Immagine con proporzioni non supportate: articolo saltato senza fermare il bot: {bad.get('title','')}");core.waha("⚠️ Instagram: articolo saltato perché l'immagine ha proporzioni non supportate.\n\n"+str(bad.get("title") or ""))
                     s=core.load_store();s["cooldown_until"]=0;s["rate_limit_level"]=0;core.save_store(s);core.sync_state(s)
-        except Exception as e:core.log(f"⚠️ Watchdog media incompatibile: {e}")
+            elif err.startswith("TEMP_IMAGE_MISSING:") and err!=last_seen:
+                last_seen=err
+                # Sposta in fondo alla coda: potrà essere riprovato più tardi senza bloccare gli altri.
+                with core.store_lock:
+                    s=core.load_store();q=s.get("queue",[])
+                    if q:
+                        bad=q.pop(0);bad["image_retry_count"]=int(bad.get("image_retry_count",0))+1
+                        if bad["image_retry_count"] < 3:
+                            q.append(bad);core.log(f"🖼️ Immagine non disponibile: articolo spostato in fondo alla coda (tentativo {bad['image_retry_count']}/3): {bad.get('title','')}")
+                        else:
+                            core.log(f"⏭️ Immagine ancora assente dopo 3 tentativi: articolo rimosso dalla coda: {bad.get('title','')}")
+                            core.waha("⚠️ Instagram: articolo saltato dopo 3 tentativi perché l'immagine non è disponibile.\n\n"+str(bad.get("title") or ""))
+                        s["queue"]=q;s["cooldown_until"]=0;s["rate_limit_level"]=0;core.save_store(s);core.sync_state(s)
+        except Exception as e:core.log(f"⚠️ Watchdog media: {e}")
         time.sleep(2)
 
-
-# --- Velocita adattiva -----------------------------------------------------------
+# --- Velocita adattiva ----------------------------------------------------------
 def speed_watchdog():
     last=None
     while True:
@@ -132,42 +153,59 @@ def speed_watchdog():
         except Exception as e:core.log(f"⚠️ Watchdog velocità: {e}")
         time.sleep(5)
 
+# Corregge il vecchio testo "2 minuti" del core.
+_core_log=core.log
+def patched_log(msg):
+    if msg=="▶️ Publisher adattivo avviato: 2 minuti tra i post, con guardia automatica sul limite Meta.":
+        msg="▶️ Publisher adattivo avviato: 90 secondi normali / 60 secondi con coda >50, con guardia Meta."
+    _core_log(msg)
+core.log=patched_log
 
-# --- Probe Meta -----------------------------------------------------------------
+# --- Probe Meta ----------------------------------------------------------------
+# La quota letta da Meta è informativa: quando siamo alla soglia appresa facciamo
+# un solo tentativo reale ogni 15 minuti. Se riesce, richiudiamo la guardia e
+# riproveremo più tardi; se Meta risponde 2207042, il core riapprende il blocco.
 def probe_guard_loop():
     while True:
         try:
             now=time.time()
+            used=core.state.get("quota_usage")
             with core.store_lock:
-                s=core.load_store();blocked=bool(s.get("limit_blocked",False));limit=s.get("adaptive_limit");queue=s.get("queue",[]);probe_after=float(s.get("probe_after",0) or 0);probe_active=bool(s.get("probe_active",False))
-                if blocked and limit is not None and queue and not probe_active:
-                    if probe_after<=0:s["probe_after"]=now+FIRST_PROBE_DELAY;core.save_store(s);core.log("🧪 Probe Meta programmato: primo tentativo controllato tra 2 minuti se la quota resta bloccata.")
+                s=core.load_store();limit=s.get("adaptive_limit");queue=s.get("queue",[]);probe_after=float(s.get("probe_after",0) or 0);probe_active=bool(s.get("probe_active",False))
+                at_guard=bool(limit is not None and used is not None and int(used)>=int(limit))
+                if at_guard and queue and not probe_active:
+                    if probe_after<=0:
+                        s["probe_after"]=now+FIRST_PROBE_DELAY;core.save_store(s);core.log("🧪 Soglia Meta raggiunta: probe reale programmato tra 2 minuti.")
                     elif now>=probe_after:
-                        old_limit=int(limit);s["probe_previous_limit"]=old_limit;s["probe_active"]=True;s["probe_started_at"]=now;s["probe_last_published"]=str(core.state.get("last_published") or "");s["probe_after"]=now+PROBE_INTERVAL;s["adaptive_limit"]=None;s["limit_blocked"]=False;s["cooldown_until"]=0;core.save_store(s);core.sync_state(s);core.log(f"🧪 Probe Meta: quota ancora bloccata alla soglia {old_limit}. Autorizzato un solo tentativo reale.")
+                        old_limit=int(limit);s["probe_previous_limit"]=old_limit;s["probe_active"]=True;s["probe_started_at"]=now;s["probe_last_published"]=str(core.state.get("last_published") or "");s["probe_after"]=now+PROBE_INTERVAL;s["adaptive_limit"]=None;s["limit_blocked"]=False;s["cooldown_until"]=0;core.save_store(s);core.sync_state(s);core.log(f"🧪 Probe Meta controllato: autorizzato UN tentativo oltre la soglia {old_limit}.")
                 elif probe_active:
                     previous=str(s.get("probe_last_published") or "");current=str(core.state.get("last_published") or "");started=float(s.get("probe_started_at",now))
-                    if blocked:s["probe_active"]=False;s["probe_after"]=now+PROBE_INTERVAL;core.save_store(s);core.log(f"⏳ Probe Meta ancora bloccato: nuovo probe tra {PROBE_INTERVAL//3600} ore.")
-                    elif current and current!=previous:s["probe_active"]=False;s["probe_after"]=0;core.save_store(s);core.log("🟢 Probe Meta riuscito: pubblicazione confermata, flusso normale riabilitato.")
+                    if bool(s.get("limit_blocked",False)):
+                        old=int(s.get("probe_previous_limit") or 49);s["adaptive_limit"]=old;s["probe_active"]=False;s["probe_after"]=now+PROBE_INTERVAL;core.save_store(s);core.sync_state(s);core.log(f"⏳ Probe Meta bloccato: guardia {old} ripristinata; nuovo tentativo tra {PROBE_INTERVAL//60} minuti.")
+                    elif current and current!=previous:
+                        old=int(s.get("probe_previous_limit") or 49);s["adaptive_limit"]=old;s["limit_blocked"]=False;s["probe_active"]=False;s["probe_after"]=now+PROBE_INTERVAL;core.save_store(s);core.sync_state(s);core.log(f"✅ Probe Meta riuscito oltre soglia: guardia {old} ripristinata; nuovo probe tra {PROBE_INTERVAL//60} minuti se necessario.")
                     elif now-started>=PROBE_TIMEOUT:
-                        old=int(s.get("probe_previous_limit") or 49);s["adaptive_limit"]=old;s["limit_blocked"]=True;s["probe_active"]=False;s["probe_after"]=now+PROBE_INTERVAL;core.save_store(s);core.sync_state(s);core.log(f"⏳ Probe Meta senza esito entro {PROBE_TIMEOUT//60} minuti: guardia ripristinata a {old}, nuovo probe tra {PROBE_INTERVAL//3600} ore.")
-                elif not blocked and probe_after and not probe_active:s["probe_after"]=0;core.save_store(s)
+                        old=int(s.get("probe_previous_limit") or 49);s["adaptive_limit"]=old;s["limit_blocked"]=True;s["probe_active"]=False;s["probe_after"]=now+PROBE_INTERVAL;core.save_store(s);core.sync_state(s);core.log(f"⏳ Probe Meta senza esito: guardia {old} ripristinata.")
+                elif not at_guard and probe_after and not probe_active:
+                    s["probe_after"]=0;core.save_store(s)
         except Exception as e:core.log(f"⚠️ Watchdog probe Meta: {e}")
-        time.sleep(15)
-
+        time.sleep(10)
 
 try:
     with core.store_lock:
         s=core.load_store();removed=smart.prune_and_rank(s);core.save_store(s);core.sync_state(s)
-    if removed:core.log(f"🧹 Migrazione coda v2.5.0: rimossi {removed} articoli scaduti/non prioritari; capienza massima 150.")
-except Exception as e:core.log(f"⚠️ Migrazione coda v2.5.0 non riuscita: {e}")
+    if removed:core.log(f"🧹 Migrazione coda v2.5.1: rimossi {removed} articoli scaduti/non prioritari; capienza massima 150.")
+except Exception as e:core.log(f"⚠️ Migrazione coda v2.5.1 non riuscita: {e}")
 
 threading.Thread(target=probe_guard_loop,daemon=True).start()
-threading.Thread(target=bad_media_queue_watchdog,daemon=True).start()
+threading.Thread(target=media_queue_watchdog,daemon=True).start()
 threading.Thread(target=speed_watchdog,daemon=True).start()
 
 if __name__=="__main__":
     core.log(f"🟢 Web UI pronta. Versione {APP_VERSION}.")
-    core.log("🧠 Coda intelligente 150 + riordino manuale + eliminazione selettiva + guardia adattiva + probe Meta attivi.")
+    core.log("🕒 Fuso orario forzato: Europe/Rome.")
+    core.log("🧠 Coda 150 + priorità manuale + eliminazione selettiva + guardia adattiva.")
+    core.log("🧪 Alla soglia Meta: un probe reale ogni 15 minuti, senza disattivare le protezioni.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
-    core.log("🖼️ Errori permanenti di aspect ratio isolati: il singolo articolo viene saltato senza fermare il bot.")
+    core.log("🖼️ Immagine mancante: articolo spostato in fondo e riprovato fino a 3 volte; aspect ratio non valido: articolo saltato.")
     core.app.run(host="0.0.0.0",port=8080)

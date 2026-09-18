@@ -213,7 +213,7 @@ def loop():
        learned=max(1,int(used)-ADAPTIVE_MARGIN) if used is not None else (int(old) if old else 49)
        s["adaptive_limit"]=min(int(old),learned) if old is not None else learned;s["limit_blocked"]=True;s["cooldown_until"]=0;save_store(s);sync_state(s)
       state["adaptive_limit"]=s["adaptive_limit"];state["last_error"]=str(e);state["publish_status"]=f"Attesa quota adattiva ({used}/{s['adaptive_limit']})";next_quota_refresh=time.time()+QUOTA_REFRESH;state["next_publish_at"]=next_quota_refresh
-      log(f"🧠 Limite Meta appreso: blocco a quota {used}; nuova soglia preventiva {s['adaptive_limit']}. Da ora nessun container finché la quota non scende sotto la soglia.");waha(f"Montagne & Paesi - Limite Meta rilevato a quota {used}. Soglia adattiva impostata a {s['adaptive_limit']}; il bot ripartirà automaticamente appena la quota scende, senza tentativi inutili.");continue
+      log(f"🧠 Limite Meta appreso: blocco a quota {used}; nuova soglia preventiva {s['adaptive_limit']}. Da ora nessun container finché la quota non scende sotto la soglia.");continue
      if is_rate_limit_error(e):
       with store_lock:s=load_store();level=min(int(s.get("rate_limit_level",0)),len(RATE_COOLDOWNS)-1);wait=RATE_COOLDOWNS[level];s["rate_limit_level"]=min(level+1,len(RATE_COOLDOWNS)-1);s["cooldown_until"]=time.time()+wait;save_store(s);sync_state(s);next_pub=s["cooldown_until"]
       state["next_publish_at"]=next_pub;state["last_error"]=str(e);state["publish_status"]="Cooldown Meta";continue

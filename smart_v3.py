@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.5.3 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.5.4 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import threading
 import time
@@ -11,9 +11,9 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.5.3"
-PROBE_INTERVAL = 15 * 60
-FIRST_PROBE_DELAY = 120
+APP_VERSION = "2.5.4"
+PROBE_INTERVAL = 60
+FIRST_PROBE_DELAY = 60
 PROBE_TIMEOUT = 180
 NORMAL_GAP = 90
 BUSY_GAP = 60
@@ -193,7 +193,7 @@ def midnight_queue_cleanup():
 
 # --- Probe Meta ----------------------------------------------------------------
 # La quota letta da Meta è informativa: quando siamo alla soglia appresa facciamo
-# un solo tentativo reale ogni 15 minuti. Se riesce, richiudiamo la guardia e
+# un solo tentativo reale ogni 1 minuto. Se riesce, richiudiamo la guardia e
 # riproveremo più tardi; se Meta risponde 2207042, il core riapprende il blocco.
 def probe_guard_loop():
     while True:
@@ -205,7 +205,7 @@ def probe_guard_loop():
                 at_guard=bool(limit is not None and used is not None and int(used)>=int(limit))
                 if at_guard and queue and not probe_active:
                     if probe_after<=0:
-                        s["probe_after"]=now+FIRST_PROBE_DELAY;core.save_store(s);core.log("🧪 Soglia Meta raggiunta: probe reale programmato tra 2 minuti.")
+                        s["probe_after"]=now+FIRST_PROBE_DELAY;core.save_store(s);core.log("🧪 Soglia Meta raggiunta: probe reale programmato tra 1 minuto.")
                     elif now>=probe_after:
                         old_limit=int(limit);s["probe_previous_limit"]=old_limit;s["probe_active"]=True;s["probe_started_at"]=now;s["probe_last_published"]=str(core.state.get("last_published") or "");s["probe_after"]=now+PROBE_INTERVAL;s["adaptive_limit"]=None;s["limit_blocked"]=False;s["cooldown_until"]=0;core.save_store(s);core.sync_state(s);core.log(f"🧪 Probe Meta controllato: autorizzato UN tentativo oltre la soglia {old_limit}.")
                 elif probe_active:
@@ -237,7 +237,7 @@ if __name__=="__main__":
     core.log("🕒 Fuso orario forzato: Europe/Rome.")
     core.log("🧠 Coda 150 + priorità manuale + eliminazione selettiva + guardia adattiva.")
     core.log("🌙 A mezzanotte la coda residua viene ridotta automaticamente ai primi 5 articoli prioritari.")
-    core.log("🧪 Alla soglia Meta: un probe reale ogni 15 minuti, senza disattivare le protezioni.")
+    core.log("🧪 Alla soglia Meta: un probe reale ogni 1 minuto, senza disattivare le protezioni.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
     core.log("🖼️ Errori media isolati: immagine mancante riprovata fino a 3 volte; aspect ratio/media type non validi saltano solo il singolo articolo.")
     core.app.run(host="0.0.0.0",port=8080)

@@ -1,23 +1,23 @@
-"""Montagne & Paesi Instagram Bot v2.5.1 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.5.2 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import threading
 import time
+
+os.environ["TZ"] = "Europe/Rome"
+if hasattr(time, "tzset"):
+    time.tzset()
+
 import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.2"
 PROBE_INTERVAL = 15 * 60
 FIRST_PROBE_DELAY = 120
 PROBE_TIMEOUT = 180
 NORMAL_GAP = 90
 BUSY_GAP = 60
 BUSY_QUEUE = 50
-
-# Forza l'ora italiana anche se il container parte in UTC.
-os.environ["TZ"] = "Europe/Rome"
-if hasattr(time, "tzset"):
-    time.tzset()
 
 smart.MAX_QUEUE = 150
 core.APP_VERSION = APP_VERSION
@@ -86,13 +86,13 @@ def is_unsupported_media_error(e):
         try:
             er=e.error or {};text += " "+str(er.get("message") or "").lower()+" "+str(er.get("error_user_title") or "").lower()+" "+str(er.get("error_user_msg") or "").lower()
         except Exception:pass
-    return any(x in text for x in ["aspect ratio is not supported","unsupported aspect ratio","image aspect ratio"])
+    return any(x in text for x in ["aspect ratio is not supported","unsupported aspect ratio","image aspect ratio","only photo or video can be accepted as media type","only photo or video can be accepted","invalid media type","unsupported media type"])
 
 _original_publish=core.publish
 def resilient_publish(token,user_id,article):
     try:return _original_publish(token,user_id,article)
     except Exception as e:
-        if is_unsupported_media_error(e):raise RuntimeError("SKIP_MEDIA_ASPECT: "+str(e))
+        if is_unsupported_media_error(e):raise RuntimeError("SKIP_MEDIA_INVALID: "+str(e))
         raise
 core.publish=resilient_publish
 
@@ -109,7 +109,7 @@ core.build_article=resilient_build
 _original_rate=core.is_rate_limit_error
 def keep_alive_error(e):
     t=str(e)
-    return t.startswith("SKIP_MEDIA_ASPECT:") or t.startswith("TEMP_IMAGE_MISSING:") or _original_rate(e)
+    return t.startswith("SKIP_MEDIA_INVALID:") or t.startswith("TEMP_IMAGE_MISSING:") or _original_rate(e)
 core.is_rate_limit_error=keep_alive_error
 
 def media_queue_watchdog():
@@ -117,12 +117,12 @@ def media_queue_watchdog():
     while True:
         try:
             err=str(core.state.get("last_error") or "")
-            if err.startswith("SKIP_MEDIA_ASPECT:") and err!=last_seen:
+            if err.startswith("SKIP_MEDIA_INVALID:") and err!=last_seen:
                 last_seen=err
                 with core.store_lock:
                     s=core.load_store()
                     if s.get("queue"):
-                        bad=s["queue"].pop(0);core.save_store(s);core.sync_state(s);core.log(f"⏭️ Immagine con proporzioni non supportate: articolo saltato senza fermare il bot: {bad.get('title','')}");core.waha("⚠️ Instagram: articolo saltato perché l'immagine ha proporzioni non supportate.\n\n"+str(bad.get("title") or ""))
+                        bad=s["queue"].pop(0);core.save_store(s);core.sync_state(s);core.log(f"⏭️ Media non compatibile con Instagram: articolo saltato senza fermare il bot: {bad.get('title','')}");core.waha("⚠️ Instagram: articolo saltato perché il media non è compatibile.\n\n"+str(bad.get("title") or ""))
                     s=core.load_store();s["cooldown_until"]=0;s["rate_limit_level"]=0;core.save_store(s);core.sync_state(s)
             elif err.startswith("TEMP_IMAGE_MISSING:") and err!=last_seen:
                 last_seen=err
@@ -194,8 +194,8 @@ def probe_guard_loop():
 try:
     with core.store_lock:
         s=core.load_store();removed=smart.prune_and_rank(s);core.save_store(s);core.sync_state(s)
-    if removed:core.log(f"🧹 Migrazione coda v2.5.1: rimossi {removed} articoli scaduti/non prioritari; capienza massima 150.")
-except Exception as e:core.log(f"⚠️ Migrazione coda v2.5.1 non riuscita: {e}")
+    if removed:core.log(f"🧹 Migrazione coda v2.5.2: rimossi {removed} articoli scaduti/non prioritari; capienza massima 150.")
+except Exception as e:core.log(f"⚠️ Migrazione coda v2.5.2 non riuscita: {e}")
 
 threading.Thread(target=probe_guard_loop,daemon=True).start()
 threading.Thread(target=media_queue_watchdog,daemon=True).start()
@@ -207,5 +207,5 @@ if __name__=="__main__":
     core.log("🧠 Coda 150 + priorità manuale + eliminazione selettiva + guardia adattiva.")
     core.log("🧪 Alla soglia Meta: un probe reale ogni 15 minuti, senza disattivare le protezioni.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
-    core.log("🖼️ Immagine mancante: articolo spostato in fondo e riprovato fino a 3 volte; aspect ratio non valido: articolo saltato.")
+    core.log("🖼️ Errori media isolati: immagine mancante riprovata fino a 3 volte; aspect ratio/media type non validi saltano solo il singolo articolo.")
     core.app.run(host="0.0.0.0",port=8080)

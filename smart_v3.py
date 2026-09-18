@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.5.2 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.5.3 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import threading
 import time
@@ -11,13 +11,14 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.5.2"
+APP_VERSION = "2.5.3"
 PROBE_INTERVAL = 15 * 60
 FIRST_PROBE_DELAY = 120
 PROBE_TIMEOUT = 180
 NORMAL_GAP = 90
 BUSY_GAP = 60
 BUSY_QUEUE = 50
+MIDNIGHT_KEEP = 5
 
 smart.MAX_QUEUE = 150
 core.APP_VERSION = APP_VERSION
@@ -161,6 +162,35 @@ def patched_log(msg):
     _core_log(msg)
 core.log=patched_log
 
+# --- Pulizia automatica coda a mezzanotte --------------------------------------
+# Una volta al giorno, appena entra nel giorno nuovo, conserva solo i primi
+# MIDNIGHT_KEEP articoli gia ordinati per priorita/manual_rank.
+def midnight_queue_cleanup():
+    last_day = None
+    while True:
+        try:
+            now = time.localtime()
+            day = time.strftime("%Y-%m-%d", now)
+            # Al primo avvio memorizza il giorno senza cancellare nulla.
+            if last_day is None:
+                last_day = day
+            elif day != last_day:
+                last_day = day
+                with core.store_lock:
+                    s = core.load_store()
+                    q = s.get("queue", [])
+                    before = len(q)
+                    if before > MIDNIGHT_KEEP:
+                        s["queue"] = q[:MIDNIGHT_KEEP]
+                        core.save_store(s)
+                        core.sync_state(s)
+                        core.log(f"🌙 Pulizia mezzanotte: mantenuti {MIDNIGHT_KEEP} articoli prioritari, eliminati {before-MIDNIGHT_KEEP} articoli residui.")
+                    else:
+                        core.log(f"🌙 Pulizia mezzanotte: coda gia ridotta ({before} articoli), nessuna eliminazione.")
+        except Exception as e:
+            core.log(f"⚠️ Pulizia mezzanotte fallita: {e}")
+        time.sleep(20)
+
 # --- Probe Meta ----------------------------------------------------------------
 # La quota letta da Meta è informativa: quando siamo alla soglia appresa facciamo
 # un solo tentativo reale ogni 15 minuti. Se riesce, richiudiamo la guardia e
@@ -200,11 +230,13 @@ except Exception as e:core.log(f"⚠️ Migrazione coda v2.5.2 non riuscita: {e}
 threading.Thread(target=probe_guard_loop,daemon=True).start()
 threading.Thread(target=media_queue_watchdog,daemon=True).start()
 threading.Thread(target=speed_watchdog,daemon=True).start()
+threading.Thread(target=midnight_queue_cleanup,daemon=True).start()
 
 if __name__=="__main__":
     core.log(f"🟢 Web UI pronta. Versione {APP_VERSION}.")
     core.log("🕒 Fuso orario forzato: Europe/Rome.")
     core.log("🧠 Coda 150 + priorità manuale + eliminazione selettiva + guardia adattiva.")
+    core.log("🌙 A mezzanotte la coda residua viene ridotta automaticamente ai primi 5 articoli prioritari.")
     core.log("🧪 Alla soglia Meta: un probe reale ogni 15 minuti, senza disattivare le protezioni.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
     core.log("🖼️ Errori media isolati: immagine mancante riprovata fino a 3 volte; aspect ratio/media type non validi saltano solo il singolo articolo.")

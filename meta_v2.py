@@ -105,14 +105,14 @@ def feed_items(rss):
 def build_article(item,entry=None):
  link=item["link"];title=item["title"];r=requests.get(link,timeout=20,headers={"User-Agent":"Mozilla/5.0"});r.raise_for_status();s=BeautifulSoup(r.text,"html.parser");og=s.find("meta",property="og:image");image=(og.get("content") or "").strip() if og else ""
  if not image:raise RuntimeError("Immagine in evidenza pubblica non trovata.")
- # Meta supporta solo JPEG per i post immagine: verifica il media prima di creare il container.
+ # Preflight leggero: verifica solo che l'immagine sia pubblicamente raggiungibile.
+ # Non bloccare in locale formati che Meta potrebbe accettare/convertire: l'esito definitivo spetta all'API.
  try:
   ir=requests.get(image,timeout=20,headers={"User-Agent":"Mozilla/5.0"},stream=True,allow_redirects=True)
   ir.raise_for_status();ctype=str(ir.headers.get("Content-Type") or "").split(";",1)[0].strip().lower()
-  head=next(ir.iter_content(chunk_size=16),b"")
-  ir.close()
-  jpeg_magic=bool(head.startswith(b"\xff\xd8\xff"))
-  if ctype not in ("image/jpeg","image/jpg") or not jpeg_magic:raise RuntimeError(f"MEDIA_PRECHECK_INVALID: formato immagine non JPEG ({ctype or 'Content-Type assente'}).")
+  head=next(ir.iter_content(chunk_size=16),b"");ir.close()
+  if not head:raise RuntimeError("MEDIA_PRECHECK_TEMP: risposta immagine vuota.")
+  if ctype and not ctype.startswith("image/"):raise RuntimeError(f"MEDIA_PRECHECK_INVALID: URL non restituisce un'immagine ({ctype}).")
  except RuntimeError:raise
  except Exception as e:raise RuntimeError("MEDIA_PRECHECK_TEMP: immagine non raggiungibile pubblicamente: "+str(e))
  body=article_text(s,entry or type("E",(),{"summary":""})());tags=smart_hashtags(title,body);suffix=f"\n\n{tags}\n\n👉 {HUB_LINK}";n=max(0,2200-len(title)-4-len(suffix));body=body[:n].rstrip()

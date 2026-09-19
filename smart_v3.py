@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.6.2 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.6.3 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import threading
 import time
@@ -11,7 +11,7 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.6.3"
 PROBE_INTERVAL = 30 * 60
 FIRST_PROBE_DELAY = 30 * 60
 PROBE_TIMEOUT = 180
@@ -260,5 +260,5 @@ if __name__=="__main__":
     core.log("🌙 A mezzanotte la coda residua viene ridotta automaticamente ai primi 5 articoli prioritari.")
     core.log("🧪 Alla soglia Meta: quota controllata ogni minuto; probe reale di sicurezza ogni 30 minuti.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
-    core.log("🖼️ Pre-controllo Meta: solo JPEG pubblico; media non validi vengono rimossi subito, errori temporanei riprovati fino a 3 volte.")
+    core.log("🖼️ Pre-controllo media: verifica raggiungibilità URL; la compatibilità finale viene verificata direttamente da Meta.")
     core.app.run(host="0.0.0.0",port=8080)

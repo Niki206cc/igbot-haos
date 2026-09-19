@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.6.1 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.6.2 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import threading
 import time
@@ -102,8 +102,13 @@ _original_build=core.build_article
 def resilient_build(item,entry=None):
     try:return _original_build(item,entry)
     except Exception as e:
-        if "immagine in evidenza pubblica non trovata" in str(e).lower():
-            raise RuntimeError("TEMP_IMAGE_MISSING: "+str(e))
+        t=str(e)
+        if "immagine in evidenza pubblica non trovata" in t.lower():
+            raise RuntimeError("TEMP_IMAGE_MISSING: "+t)
+        # I nuovi precheck del core devono mantenere il marker, altrimenti
+        # il core li tratta come errori generici e applica un cooldown di 5 minuti.
+        if t.startswith("MEDIA_PRECHECK_INVALID:") or t.startswith("MEDIA_PRECHECK_TEMP:"):
+            raise
         raise
 core.build_article=resilient_build
 
@@ -255,5 +260,5 @@ if __name__=="__main__":
     core.log("🌙 A mezzanotte la coda residua viene ridotta automaticamente ai primi 5 articoli prioritari.")
     core.log("🧪 Alla soglia Meta: quota controllata ogni minuto; probe reale di sicurezza ogni 30 minuti.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
-    core.log("🖼️ Pre-controllo Meta: solo JPEG pubblico; errori temporanei riprovati fino a 3 volte, media non validi saltano il singolo articolo.")
+    core.log("🖼️ Pre-controllo Meta: solo JPEG pubblico; media non validi vengono rimossi subito, errori temporanei riprovati fino a 3 volte.")
     core.app.run(host="0.0.0.0",port=8080)

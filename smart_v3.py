@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.6.3 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.6.4 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import threading
 import time
@@ -18,7 +18,7 @@ PROBE_TIMEOUT = 180
 NORMAL_GAP = 90
 BUSY_GAP = 60
 BUSY_QUEUE = 50
-MIDNIGHT_KEEP = 5
+MIDNIGHT_KEEP = 0
 
 smart.MAX_QUEUE = 150
 core.APP_VERSION = APP_VERSION
@@ -168,32 +168,24 @@ def patched_log(msg):
 core.log=patched_log
 
 # --- Pulizia automatica coda a mezzanotte --------------------------------------
-# Una volta al giorno, appena entra nel giorno nuovo, conserva solo i primi
-# MIDNIGHT_KEEP articoli gia ordinati per priorita/manual_rank.
+# La coda del giorno precedente non deve mai arrivare al giorno successivo.
+# Salviamo l'ultimo giorno controllato nello store: così la pulizia funziona
+# sia al cambio data con container acceso, sia dopo un riavvio avvenuto dopo mezzanotte.
 def midnight_queue_cleanup():
-    last_day = None
     while True:
         try:
-            now = time.localtime()
-            day = time.strftime("%Y-%m-%d", now)
-            # Al primo avvio memorizza il giorno senza cancellare nulla.
-            if last_day is None:
-                last_day = day
-            elif day != last_day:
-                last_day = day
-                with core.store_lock:
-                    s = core.load_store()
-                    q = s.get("queue", [])
-                    before = len(q)
-                    if before > MIDNIGHT_KEEP:
-                        s["queue"] = q[:MIDNIGHT_KEEP]
-                        core.save_store(s)
-                        core.sync_state(s)
-                        core.log(f"🌙 Pulizia mezzanotte: mantenuti {MIDNIGHT_KEEP} articoli prioritari, eliminati {before-MIDNIGHT_KEEP} articoli residui.")
-                    else:
-                        core.log(f"🌙 Pulizia mezzanotte: coda gia ridotta ({before} articoli), nessuna eliminazione.")
-        except Exception as e:
-            core.log(f"⚠️ Pulizia mezzanotte fallita: {e}")
+            day=time.strftime("%Y-%m-%d",time.localtime())
+            with core.store_lock:
+                s=core.load_store();last=str(s.get("queue_cleanup_day") or "")
+                if last!=day:
+                    q=s.get("queue",[]);removed=len(q)
+                    s["queue"]=[];s["queue_cleanup_day"]=day
+                    # Un eventuale cooldown/probe del giorno prima non deve trattenere i nuovi articoli.
+                    s["cooldown_until"]=0;s["probe_after"]=0;s["probe_active"]=False
+                    core.save_store(s);core.sync_state(s)
+                    if removed:core.log(f"🌙 Nuovo giorno: coda del giorno precedente svuotata, rimossi {removed} articoli.")
+                    else:core.log("🌙 Nuovo giorno: coda già vuota.")
+        except Exception as e:core.log(f"⚠️ Pulizia giornaliera coda fallita: {e}")
         time.sleep(20)
 
 # --- Probe Meta ----------------------------------------------------------------
@@ -257,7 +249,7 @@ if __name__=="__main__":
     core.log(f"🟢 Web UI pronta. Versione {APP_VERSION}.")
     core.log("🕒 Fuso orario forzato: Europe/Rome.")
     core.log("🧠 Coda 150 + priorità manuale + eliminazione selettiva + guardia adattiva.")
-    core.log("🌙 A mezzanotte la coda residua viene ridotta automaticamente ai primi 5 articoli prioritari.")
+    core.log("🌙 Cambio giorno: la coda residua del giorno precedente viene svuotata completamente, anche dopo un riavvio.")
     core.log("🧪 Alla soglia Meta: quota controllata ogni minuto; probe reale di sicurezza ogni 30 minuti.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
     core.log("🖼️ Pre-controllo media: verifica raggiungibilità URL; la compatibilità finale viene verificata direttamente da Meta.")

@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.6.4 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.7.0 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import threading
 import time
@@ -94,6 +94,7 @@ def resilient_publish(token,user_id,article):
     try:return _original_publish(token,user_id,article)
     except Exception as e:
         if is_unsupported_media_error(e):raise RuntimeError("SKIP_MEDIA_INVALID: "+str(e))
+        if "media id is not available" in str(e).lower():raise RuntimeError("TEMP_META_MEDIA: "+str(e))
         raise
 core.publish=resilient_publish
 
@@ -115,7 +116,7 @@ core.build_article=resilient_build
 _original_rate=core.is_rate_limit_error
 def keep_alive_error(e):
     t=str(e)
-    return t.startswith("SKIP_MEDIA_INVALID:") or t.startswith("TEMP_IMAGE_MISSING:") or t.startswith("MEDIA_PRECHECK_INVALID:") or t.startswith("MEDIA_PRECHECK_TEMP:") or _original_rate(e)
+    return t.startswith("SKIP_MEDIA_INVALID:") or t.startswith("TEMP_IMAGE_MISSING:") or t.startswith("MEDIA_PRECHECK_INVALID:") or t.startswith("MEDIA_PRECHECK_TEMP:") or t.startswith("TEMP_META_MEDIA:") or _original_rate(e)
 core.is_rate_limit_error=keep_alive_error
 
 def media_queue_watchdog():
@@ -130,7 +131,7 @@ def media_queue_watchdog():
                     if s.get("queue"):
                         bad=s["queue"].pop(0);core.save_store(s);core.sync_state(s);core.log(f"⏭️ Media non compatibile con Instagram: articolo saltato senza fermare il bot: {bad.get('title','')}");core.waha("⚠️ Instagram: articolo saltato perché il media non è compatibile.\n\n"+str(bad.get("title") or ""))
                     s=core.load_store();s["cooldown_until"]=0;s["rate_limit_level"]=0;core.save_store(s);core.sync_state(s)
-            elif (err.startswith("TEMP_IMAGE_MISSING:") or err.startswith("MEDIA_PRECHECK_TEMP:")) and err!=last_seen:
+            elif (err.startswith("TEMP_IMAGE_MISSING:") or err.startswith("MEDIA_PRECHECK_TEMP:") or err.startswith("TEMP_META_MEDIA:")) and err!=last_seen:
                 last_seen=err
                 # Sposta in fondo alla coda: potrà essere riprovato più tardi senza bloccare gli altri.
                 with core.store_lock:
@@ -239,7 +240,33 @@ def quota_minute_loop():
         except Exception as e:core.log(f"⚠️ Controllo quota minuto: {e}")
         time.sleep(60)
 
+# --- Autoripristino publisher ---------------------------------------------------
+# Gli errori imprevisti non devono lasciare il publisher fermo.
+# /stop manuale non viene riavviato perché non imposta last_error.
+def bot_autorestart_watchdog():
+    last_restart=0
+    while True:
+        try:
+            err=str(core.state.get("last_error") or "")
+            running=bool(core.state.get("running"))
+            alive=bool(core.bot_thread and core.bot_thread.is_alive())
+            if err and not running and not alive and time.time()-last_restart>=60:
+                last_restart=time.time()
+                core.log(f"♻️ Publisher fermo per errore: autoripristino. Ultimo errore: {err}")
+                time.sleep(5)
+                if not core.state.get("running") and not (core.bot_thread and core.bot_thread.is_alive()):
+                    core.stop_event.clear()
+                    core.state["running"]=True
+                    core.state["publish_status"]="Riavvio automatico"
+                    core.bot_thread=threading.Thread(target=core.loop,daemon=True)
+                    core.bot_thread.start()
+                    core.log("✅ Publisher riavviato automaticamente.")
+        except Exception as e:
+            core.log(f"⚠️ Watchdog autoripristino: {e}")
+        time.sleep(15)
+
 threading.Thread(target=probe_guard_loop,daemon=True).start()
+threading.Thread(target=bot_autorestart_watchdog,daemon=True).start()
 threading.Thread(target=quota_minute_loop,daemon=True).start()
 threading.Thread(target=media_queue_watchdog,daemon=True).start()
 threading.Thread(target=speed_watchdog,daemon=True).start()
@@ -253,4 +280,5 @@ if __name__=="__main__":
     core.log("🧪 Alla soglia Meta: quota controllata ogni minuto; probe reale di sicurezza ogni 30 minuti.")
     core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
     core.log("🖼️ Pre-controllo media: verifica raggiungibilità URL; la compatibilità finale viene verificata direttamente da Meta.")
+    core.log("♻️ Autoripristino attivo: se il publisher si ferma per errore, viene riavviato automaticamente.")
     core.app.run(host="0.0.0.0",port=8080)

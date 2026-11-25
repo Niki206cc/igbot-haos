@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.6.5 - timeout feed RSS, adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.7.0 - ritmo distribuito, tetto nazionali, timeout feed RSS, adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import socket
 import threading
@@ -15,7 +15,7 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.6.5"
+APP_VERSION = "2.7.0"
 PROBE_INTERVAL = 30 * 60
 FIRST_PROBE_DELAY = 30 * 60
 PROBE_TIMEOUT = 180
@@ -151,6 +151,96 @@ def media_queue_watchdog():
         except Exception as e:core.log(f"⚠️ Watchdog media: {e}")
         time.sleep(2)
 
+# --- Ritmo distribuito + tetto notizie nazionali (v2.7.0) ----------------------
+# Meta concede 50 post in 24 ore mobili. Invece di bruciarli in un'ora, il bot li
+# distribuisce tra PACE_START_HOUR e PACE_END_HOUR, tiene URGENT_RESERVE post per
+# le notizie urgenti locali (pubblicate subito, a qualsiasi ora) e limita a
+# NATIONAL_DAILY_MAX al giorno le notizie di agenzia (Adnkronos / Nazionali).
+PACE_START_HOUR = int(os.getenv("PACE_START_HOUR", "6"))
+PACE_END_HOUR = int(os.getenv("PACE_END_HOUR", "23"))
+URGENT_RESERVE = int(os.getenv("URGENT_RESERVE", "6"))
+NATIONAL_DAILY_MAX = int(os.getenv("NATIONAL_DAILY_MAX", "10"))
+PACE_MIN_GAP = int(os.getenv("PACE_MIN_GAP", "600"))
+PACE_MAX_GAP = int(os.getenv("PACE_MAX_GAP", "2700"))
+PACE_URGENT_TERMS = ["incidente","schianto","mortale","morto","morta","deceduto","ferito","ferita","feriti","elisoccorso",
+    "incendio","maltempo","frana","alluvione","esondazione","caduta massi","strada chiusa","chiusa la strada","scomparso",
+    "scomparsa","disperso","dispersa","soccorso","allerta","valanga"]
+_pace_last_status = [""]
+
+def is_urgent_item(x):
+    if x.get("national"):return False
+    t = smart.norm(x.get("title", ""))
+    return any(term in t for term in PACE_URGENT_TERMS)
+
+def _national_count(s, day):
+    d = s.get("national_day") or {}
+    return int(d.get("count", 0)) if d.get("date") == day else 0
+
+def _pace_status(msg, log_it=True):
+    core.state["publish_status"] = msg
+    if log_it and msg != _pace_last_status[0]:
+        _pace_last_status[0] = msg
+        core.log("🕰️ " + msg)
+
+def _ts_at_hour(hour, days_ahead=0):
+    lt = time.localtime()
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + days_ahead, hour, 0, 0, 0, 0, -1))
+
+def paced_select_item(s):
+    q = s.get("queue", [])
+    if not q:return None, 0
+    now = time.time();day = time.strftime("%Y-%m-%d", time.localtime(now))
+
+    # Tetto giornaliero notizie nazionali: oltre la soglia vengono tolte dalla coda.
+    if _national_count(s, day) >= NATIONAL_DAILY_MAX:
+        nat = [x for x in q if x.get("national")]
+        if nat:
+            s["queue"] = [x for x in q if not x.get("national")];core.save_store(s);core.sync_state(s)
+            core.log(f"🧹 Tetto nazionali ({NATIONAL_DAILY_MAX}/giorno) raggiunto: tolte {len(nat)} notizie di agenzia dalla coda.")
+            q = s["queue"]
+            if not q:return None, 0
+
+    urgent = [x for x in q if is_urgent_item(x)]
+    item = urgent[0] if urgent else q[0]
+    if urgent:
+        _pace_status(f"Notizia urgente: pubblicazione immediata ({item.get('title','')[:60]})")
+        return item, 0
+
+    hour = time.localtime(now).tm_hour
+    if not (PACE_START_HOUR <= hour < PACE_END_HOUR):
+        start = _ts_at_hour(PACE_START_HOUR, 0 if hour < PACE_START_HOUR else 1)
+        _pace_status(f"Pausa notturna: le notizie normali ripartono alle {PACE_START_HOUR:02d}:00 (urgenti sempre attive)")
+        return item, start
+
+    limit = s.get("adaptive_limit") or core.state.get("quota_total") or 50
+    used = int(core.state.get("quota_usage") or 0)
+    remaining = int(limit) - URGENT_RESERVE - used
+    if remaining <= 0:
+        _pace_status(f"Quota {used}/{limit}: ultimi {URGENT_RESERVE} post tenuti di riserva per le notizie urgenti")
+        return item, now + 120
+
+    end = _ts_at_hour(PACE_END_HOUR)
+    gap = max(PACE_MIN_GAP, min(PACE_MAX_GAP, (end - now) / remaining))
+    due = float(s.get("pace_last_publish", 0)) + gap
+    if due > now:
+        _pace_status(f"Ritmo distribuito: un post ogni {int(gap//60)} minuti ({remaining} disponibili fino alle {PACE_END_HOUR}:00)")
+    return item, due
+
+def paced_on_published(item):
+    try:
+        with core.store_lock:
+            s = core.load_store();day = time.strftime("%Y-%m-%d", time.localtime())
+            s["pace_last_publish"] = time.time()
+            if item and item.get("national"):
+                n = _national_count(s, day) + 1
+                s["national_day"] = {"date": day, "count": n}
+                core.log(f"🌍 Notizia nazionale pubblicata: {n}/{NATIONAL_DAILY_MAX} oggi.")
+            core.save_store(s)
+    except Exception as e:core.log(f"⚠️ Contatore ritmo: {e}")
+
+core.select_item = paced_select_item
+core.on_published = paced_on_published
+
 # --- Velocita adattiva ----------------------------------------------------------
 def speed_watchdog():
     last=None
@@ -282,7 +372,8 @@ if __name__=="__main__":
     core.log("🧠 Coda 150 + priorità manuale + eliminazione selettiva + guardia adattiva.")
     core.log("🌙 Cambio giorno: la coda residua del giorno precedente viene svuotata completamente, anche dopo un riavvio.")
     core.log("🧪 Alla soglia Meta: quota controllata ogni minuto; probe reale di sicurezza ogni 30 minuti.")
-    core.log("⚡ Ritmo adattivo: 90 secondi normale, 60 secondi con oltre 50 articoli in coda.")
+    core.log(f"🕰️ Ritmo distribuito: post normali tra le {PACE_START_HOUR}:00 e le {PACE_END_HOUR}:00, {URGENT_RESERVE} post di riserva per le urgenti.")
+    core.log(f"🌍 Notizie di agenzia/nazionali: massimo {NATIONAL_DAILY_MAX} al giorno.")
     core.log("🖼️ Pre-controllo media: verifica raggiungibilità URL; la compatibilità finale viene verificata direttamente da Meta.")
     core.log("♻️ Autoripristino attivo: se il publisher si ferma per errore, viene riavviato automaticamente.")
     core.app.run(host="0.0.0.0",port=8080)

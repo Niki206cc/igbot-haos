@@ -35,17 +35,21 @@ def prune_and_rank(s):
   if excluded(title):dropped+=1;continue
   added=float(x.get("added_at") or now);age_limit=6*3600 if any(k in norm(title) for k in URGENT_TERMS) else MAX_AGE_HOURS*3600
   if now-added>age_limit:dropped+=1;continue
-  x["added_at"]=added;x["priority"]=score(title);kept.append(x)
+  x["added_at"]=added;x["priority"]=score(title)-(40 if x.get("national") else 0);kept.append(x)
  kept.sort(key=lambda x:(-int(x.get("priority",0)),-float(x.get("added_at",0))))
  if len(kept)>MAX_QUEUE:dropped+=len(kept)-MAX_QUEUE;kept=kept[:MAX_QUEUE]
  s["queue"]=kept;return dropped
+def is_national(e):
+ author=str(getattr(e,"author","") or "").lower()
+ tags=" ".join(str(t.get("term","")) for t in (getattr(e,"tags",None) or [])).lower()
+ return "adnkronos" in author or "nazionali" in tags
 def smart_discover(rss):
  f=core.fetch_feed(rss)
  if not f.entries:raise RuntimeError("Nessun articolo disponibile nel feed RSS.")
  items=[]
  for e in f.entries:
   link=str(getattr(e,"link","")).strip();title=core.clean(str(getattr(e,"title","")))
-  if link and title:items.append({"title":title,"link":link,"added_at":entry_ts(e),"priority":score(title)})
+  if link and title:nat=is_national(e);items.append({"title":title,"link":link,"added_at":entry_ts(e),"priority":score(title)-(40 if nat else 0),"national":nat})
  if not items:raise RuntimeError("Feed RSS senza articoli validi.")
  links=[x["link"] for x in items]
  with core.store_lock:

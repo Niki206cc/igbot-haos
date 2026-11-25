@@ -145,6 +145,12 @@ def publish(t,u,a):
  mid=str(d.get("id") or "")
  if not mid:raise RuntimeError("Media ID Meta mancante.")
  return mid
+def select_item(s):
+ # Hook: sceglie l'articolo da pubblicare e il primo istante consentito (0 = subito).
+ return (s["queue"][0] if s["queue"] else None),0
+def on_published(item):
+ # Hook: chiamato dopo ogni pubblicazione riuscita.
+ pass
 def set_last(x):
  os.makedirs("/data",exist_ok=True)
  with open(LAST_POST_PATH,"w",encoding="utf-8") as f:f.write(x)
@@ -204,8 +210,8 @@ def loop():
   while not stop_event.is_set():
    now=time.time()
    if now>=next_quota_refresh:publishing_limit(token,uid,True);next_quota_refresh=now+QUOTA_REFRESH
-   with store_lock:s=load_store();prune_history(s);item=s["queue"][0] if s["queue"] else None;cooldown=float(s.get("cooldown_until",0));limit=s.get("adaptive_limit");blocked=bool(s.get("limit_blocked",False));sync_state(s)
-   used=state.get("quota_usage");due=max(next_pub,cooldown)
+   with store_lock:s=load_store();prune_history(s);item,gate=select_item(s);cooldown=float(s.get("cooldown_until",0));limit=s.get("adaptive_limit");blocked=bool(s.get("limit_blocked",False));sync_state(s)
+   used=state.get("quota_usage");due=max(next_pub,cooldown,gate)
    guard=bool(item and limit is not None and used is not None and int(used)>=int(limit))
    if guard:
     state["publish_status"]=f"Attesa quota adattiva ({used}/{limit})";state["next_publish_at"]=next_quota_refresh
@@ -224,7 +230,7 @@ def loop():
     try:
      a=build_article(item);state["preview"]=a;mid=publish(token,uid,a)
      with store_lock:s=load_store();s["queue"]=[x for x in s["queue"] if x.get("link")!=item["link"]];set_last(item["link"]);remember_title(s,item["title"]);stat_inc(s,"published");s["rate_limit_level"]=0;s["cooldown_until"]=0;s["limit_blocked"]=False;save_store(s);sync_state(s);has_more=bool(s["queue"])
-     state["last_published"]=item["title"];state["last_error"]="";state["publish_status"]="Operativo";log(f"✅ Pubblicato via API Meta. Media ID: {mid}");publishing_limit(token,uid,True);next_pub=time.time()+PUBLISH_GAP;state["next_publish_at"]=next_pub if has_more else 0
+     state["last_published"]=item["title"];state["last_error"]="";state["publish_status"]="Operativo";log(f"✅ Pubblicato via API Meta. Media ID: {mid}");on_published(item);publishing_limit(token,uid,True);next_pub=time.time()+PUBLISH_GAP;state["next_publish_at"]=next_pub if has_more else 0
     except Exception as e:
      if is_content_publish_limit(e):
       used=state.get("quota_usage")

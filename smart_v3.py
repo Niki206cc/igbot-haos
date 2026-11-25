@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.7.0 - ritmo distribuito, tetto nazionali, timeout feed RSS, adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.8.0 - nuova dashboard, pubblicazione manuale, ritmo distribuito, tetto nazionali, timeout feed RSS, adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import socket
 import threading
@@ -15,7 +15,7 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 PROBE_INTERVAL = 30 * 60
 FIRST_PROBE_DELAY = 30 * 60
 PROBE_TIMEOUT = 180
@@ -70,19 +70,7 @@ def queue_delete():
     core.log(f"🗑️ Rimossi manualmente {removed} articoli dalla coda.")
     return jsonify({"ok":True,"removed":removed})
 
-# --- UI coda -------------------------------------------------------------------
-core.PAGE = core.PAGE.replace(
-    '<b>Coda — <span id="qcount">0</span></b> <button class="btn danger" onclick="clearQueue()">Cancella coda</button>',
-    '<b>Coda — <span id="qcount">0</span></b> <button class="btn danger" onclick="deleteSelected()">Elimina selezionati</button> <button class="btn danger" onclick="clearQueue()">Cancella coda</button><div class="small">★ porta subito in cima • ↑/↓ cambia priorità • seleziona più articoli e usa Elimina selezionati</div>'
-)
-core.PAGE = core.PAGE.replace(
-    "q.forEach(x=>{let li=document.createElement('li');li.textContent=x.title;queue.appendChild(li)})",
-    "q.forEach(x=>{let li=document.createElement('li');li.style.display='flex';li.style.gap='6px';li.style.alignItems='center';let cb=document.createElement('input');cb.type='checkbox';cb.className='qsel';cb.value=x.link;cb.style.width='auto';cb.style.margin='0';let tx=document.createElement('span');tx.textContent=x.title;tx.style.flex='1';let top=document.createElement('button');top.textContent='★';top.className='btn';top.onclick=()=>moveQueue(x.link,'top');let up=document.createElement('button');up.textContent='↑';up.className='btn';up.onclick=()=>moveQueue(x.link,'up');let dn=document.createElement('button');dn.textContent='↓';dn.className='btn';dn.onclick=()=>moveQueue(x.link,'down');let del=document.createElement('button');del.textContent='✕';del.className='btn danger';del.onclick=()=>deleteLinks([x.link]);li.append(cb,tx,top,up,dn,del);queue.appendChild(li)})"
-)
-core.PAGE = core.PAGE.replace(
-    "async function clearQueue()",
-    "async function moveQueue(link,action){await fetch('/queue_move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({link:link,action:action})});refresh()}async function deleteLinks(links){if(!links.length)return;if(confirm('Rimuovere dalla coda '+links.length+' articoli?')){await fetch('/queue_delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({links:links})});refresh()}}async function deleteSelected(){let links=[...document.querySelectorAll('.qsel:checked')].map(x=>x.value);if(!links.length){alert('Seleziona almeno un articolo.');return}deleteLinks(links)}async function clearQueue()"
-)
+# --- UI coda: vedi dashboard in fondo al file (v2.8.0) ------------------------
 
 # --- Errori media non fatali ----------------------------------------------------
 def is_unsupported_media_error(e):
@@ -240,6 +228,9 @@ def paced_on_published(item):
 
 core.select_item = paced_select_item
 core.on_published = paced_on_published
+core.is_urgent_item = is_urgent_item
+core.national_count_today = lambda s: _national_count(s, time.strftime("%Y-%m-%d", time.localtime()))
+core.NATIONAL_DAILY_MAX = NATIONAL_DAILY_MAX
 
 # --- Velocita adattiva ----------------------------------------------------------
 def speed_watchdog():
@@ -365,6 +356,8 @@ threading.Thread(target=quota_minute_loop,daemon=True).start()
 threading.Thread(target=media_queue_watchdog,daemon=True).start()
 threading.Thread(target=speed_watchdog,daemon=True).start()
 threading.Thread(target=midnight_queue_cleanup,daemon=True).start()
+
+import dashboard_v4  # dashboard grafica, pubblicazione manuale, miniature coda
 
 if __name__=="__main__":
     core.log(f"🟢 Web UI pronta. Versione {APP_VERSION}.")

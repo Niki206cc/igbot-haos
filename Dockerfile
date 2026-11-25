@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY meta_v2.py .
 COPY smart_v2.py .
 COPY smart_v3.py .
+COPY dashboard_v4.py .
 
 EXPOSE 8080
 CMD ["python", "smart_v3.py"]

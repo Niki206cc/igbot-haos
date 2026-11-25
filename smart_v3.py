@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.7.0 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.6.5 - timeout feed RSS, adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import socket
 import threading
@@ -15,7 +15,7 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.6.4"
+APP_VERSION = "2.6.5"
 PROBE_INTERVAL = 30 * 60
 FIRST_PROBE_DELAY = 30 * 60
 PROBE_TIMEOUT = 180

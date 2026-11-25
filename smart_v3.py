@@ -1,7 +1,11 @@
 """Montagne & Paesi Instagram Bot v2.7.0 - adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
+import socket
 import threading
 import time
+
+# Rete di sicurezza: nessuna connessione può restare appesa per sempre.
+socket.setdefaulttimeout(60)
 
 os.environ["TZ"] = "Europe/Rome"
 if hasattr(time, "tzset"):

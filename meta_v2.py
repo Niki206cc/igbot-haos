@@ -93,8 +93,15 @@ def smart_hashtags(title,body):
  for w in re.findall(r"[A-Za-zÀ-ÿ0-9]+",text):
   if len(w)>=6 and w.lower() not in stop and w[:1].isupper():add(w[:1].upper()+w[1:])
  add("MontagneEPaesi");return " ".join("#"+x for x in tags[:7])
+FEED_TIMEOUT=30
+def fetch_feed(rss):
+ # Scarica il feed con timeout: feedparser.parse(url) non ne ha uno e, se il sito
+ # non risponde, blocca lo scanner per sempre.
+ r=requests.get(rss,params={"nocache":int(time.time())},timeout=FEED_TIMEOUT,headers={"User-Agent":"Mozilla/5.0 (MontagnePaesi-IGBot)","Cache-Control":"no-cache","Pragma":"no-cache"})
+ if r.status_code!=200:raise RuntimeError(f"Feed RSS HTTP {r.status_code}")
+ return feedparser.parse(r.content)
 def feed_items(rss):
- f=feedparser.parse(rss)
+ f=fetch_feed(rss)
  if not f.entries:raise RuntimeError("Nessun articolo disponibile nel feed RSS.")
  out=[]
  for e in f.entries:

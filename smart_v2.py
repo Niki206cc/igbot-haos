@@ -40,7 +40,7 @@ def prune_and_rank(s):
  if len(kept)>MAX_QUEUE:dropped+=len(kept)-MAX_QUEUE;kept=kept[:MAX_QUEUE]
  s["queue"]=kept;return dropped
 def smart_discover(rss):
- f=feedparser.parse(rss)
+ f=core.fetch_feed(rss)
  if not f.entries:raise RuntimeError("Nessun articolo disponibile nel feed RSS.")
  items=[]
  for e in f.entries:

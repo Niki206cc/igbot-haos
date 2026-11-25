@@ -28,6 +28,7 @@ def rich_sync_state(s):
     with core.lock:
         core.state["queue"] = q
         core.state["adaptive_limit"] = s.get("adaptive_limit")
+        core.state["last_post"] = s.get("last_post")
         core.state["published_today"] = int((s.get("stats", {}).get(day) or {}).get("published", 0))
         core.state["national_today"] = core.national_count_today(s) if hasattr(core, "national_count_today") else 0
         core.state["national_max"] = getattr(core, "NATIONAL_DAILY_MAX", 10)

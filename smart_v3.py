@@ -1,4 +1,4 @@
-"""Montagne & Paesi Instagram Bot v2.8.0 - nuova dashboard, pubblicazione manuale, ritmo distribuito, tetto nazionali, timeout feed RSS, adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
+"""Montagne & Paesi Instagram Bot v2.8.1 - ultimo post per Control Center, nuova dashboard, pubblicazione manuale, ritmo distribuito, tetto nazionali, timeout feed RSS, adaptive speed, manual queue controls, resilient media, guarded Meta probes."""
 import os
 import socket
 import threading
@@ -15,7 +15,7 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 PROBE_INTERVAL = 30 * 60
 FIRST_PROBE_DELAY = 30 * 60
 PROBE_TIMEOUT = 180
@@ -219,6 +219,13 @@ def paced_on_published(item):
         with core.store_lock:
             s = core.load_store();day = time.strftime("%Y-%m-%d", time.localtime())
             s["pace_last_publish"] = time.time()
+            prev = core.state.get("preview") or {}
+            s["last_post"] = {
+                "title": (item or {}).get("title", ""),
+                "link": (item or {}).get("link", ""),
+                "image": prev.get("image_url") or (item or {}).get("image") or "",
+                "when": __import__("datetime").datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
             if item and item.get("national"):
                 n = _national_count(s, day) + 1
                 s["national_day"] = {"date": day, "count": n}

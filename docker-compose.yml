@@ -17,7 +17,7 @@ services:
       DEFAULT_RSS: "https://www.montagneepaesi.com/feed/"
       HUB_LINK: "www.montagneepaesi.com/instagram"
       WA_CHANNEL_URL: "https://whatsapp.com/channel/0029Vb7fcHT8aKvFAuCIfm0c"
-      NATIONAL_DAILY_MAX: "20"
+      NATIONAL_FILLER_GAP: "1800"   # notizie d'agenzia: al massimo una ogni 30 minuti quando mancano le locali
 
 volumes:
   igbot_data:

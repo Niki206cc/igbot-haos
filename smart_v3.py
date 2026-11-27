@@ -15,7 +15,7 @@ import smart_v2 as smart
 import meta_v2 as core
 from flask import request, jsonify
 
-APP_VERSION = "2.8.1"
+APP_VERSION = "2.9.0"
 PROBE_INTERVAL = 30 * 60
 FIRST_PROBE_DELAY = 30 * 60
 PROBE_TIMEOUT = 180
@@ -150,6 +150,11 @@ URGENT_RESERVE = int(os.getenv("URGENT_RESERVE", "6"))
 NATIONAL_DAILY_MAX = int(os.getenv("NATIONAL_DAILY_MAX", "10"))
 PACE_MIN_GAP = int(os.getenv("PACE_MIN_GAP", "600"))
 PACE_MAX_GAP = int(os.getenv("PACE_MAX_GAP", "2700"))
+# Notizie di agenzia come "riempitivo": non vengono più tolte dalla coda. Si
+# pubblicano solo quando non ci sono notizie locali, al massimo una ogni
+# NATIONAL_FILLER_GAP secondi (default 30 minuti), così la sera il profilo non
+# resta fermo per ore.
+NATIONAL_FILLER_GAP = int(os.getenv("NATIONAL_FILLER_GAP", "1800"))
 PACE_URGENT_TERMS = ["incidente","schianto","mortale","morto","morta","deceduto","ferito","ferita","feriti","elisoccorso",
     "incendio","maltempo","frana","alluvione","esondazione","caduta massi","strada chiusa","chiusa la strada","scomparso",
     "scomparsa","disperso","dispersa","soccorso","allerta","valanga"]
@@ -179,17 +184,10 @@ def paced_select_item(s):
     if not q:return None, 0
     now = time.time();day = time.strftime("%Y-%m-%d", time.localtime(now))
 
-    # Tetto giornaliero notizie nazionali: oltre la soglia vengono tolte dalla coda.
-    if _national_count(s, day) >= NATIONAL_DAILY_MAX:
-        nat = [x for x in q if x.get("national")]
-        if nat:
-            s["queue"] = [x for x in q if not x.get("national")];core.save_store(s);core.sync_state(s)
-            core.log(f"🧹 Tetto nazionali ({NATIONAL_DAILY_MAX}/giorno) raggiunto: tolte {len(nat)} notizie di agenzia dalla coda.")
-            q = s["queue"]
-            if not q:return None, 0
-
     urgent = [x for x in q if is_urgent_item(x)]
-    item = urgent[0] if urgent else q[0]
+    local = [x for x in q if not x.get("national")]
+    # Prima sempre le locali; le notizie d'agenzia solo quando non c'è altro.
+    item = urgent[0] if urgent else (local[0] if local else q[0])
     if urgent:
         _pace_status(f"Notizia urgente: pubblicazione immediata ({item.get('title','')[:60]})")
         return item, 0
@@ -209,9 +207,14 @@ def paced_select_item(s):
 
     end = _ts_at_hour(PACE_END_HOUR)
     gap = max(PACE_MIN_GAP, min(PACE_MAX_GAP, (end - now) / remaining))
+    if item.get("national"):
+        gap = max(gap, NATIONAL_FILLER_GAP)
     due = float(s.get("pace_last_publish", 0)) + gap
     if due > now:
-        _pace_status(f"Ritmo distribuito: un post ogni {int(gap//60)} minuti ({remaining} disponibili fino alle {PACE_END_HOUR}:00)")
+        if item.get("national"):
+            _pace_status(f"Nessuna notizia locale in coda: notizia d'agenzia ogni {int(gap//60)} minuti")
+        else:
+            _pace_status(f"Ritmo distribuito: un post ogni {int(gap//60)} minuti ({remaining} disponibili fino alle {PACE_END_HOUR}:00)")
     return item, due
 
 def paced_on_published(item):
@@ -229,7 +232,7 @@ def paced_on_published(item):
             if item and item.get("national"):
                 n = _national_count(s, day) + 1
                 s["national_day"] = {"date": day, "count": n}
-                core.log(f"🌍 Notizia nazionale pubblicata: {n}/{NATIONAL_DAILY_MAX} oggi.")
+                core.log(f"🌍 Notizia d'agenzia pubblicata (n. {n} oggi).")
             core.save_store(s)
     except Exception as e:core.log(f"⚠️ Contatore ritmo: {e}")
 
@@ -373,7 +376,7 @@ if __name__=="__main__":
     core.log("🌙 Cambio giorno: la coda residua del giorno precedente viene svuotata completamente, anche dopo un riavvio.")
     core.log("🧪 Alla soglia Meta: quota controllata ogni minuto; probe reale di sicurezza ogni 30 minuti.")
     core.log(f"🕰️ Ritmo distribuito: post normali tra le {PACE_START_HOUR}:00 e le {PACE_END_HOUR}:00, {URGENT_RESERVE} post di riserva per le urgenti.")
-    core.log(f"🌍 Notizie di agenzia/nazionali: massimo {NATIONAL_DAILY_MAX} al giorno.")
+    core.log(f"🌍 Notizie di agenzia: restano in coda e si pubblicano quando mancano notizie locali, al massimo una ogni {NATIONAL_FILLER_GAP//60} minuti.")
     core.log("🖼️ Pre-controllo media: verifica raggiungibilità URL; la compatibilità finale viene verificata direttamente da Meta.")
     core.log("♻️ Autoripristino attivo: se il publisher si ferma per errore, viene riavviato automaticamente.")
     core.app.run(host="0.0.0.0",port=8080)

@@ -195,7 +195,7 @@ details>summary{cursor:pointer;font-weight:700;color:var(--mute);text-transform:
 </div></header>
 <main>
  <div class="card"><h3>Quota Meta (24 ore)</h3><div class="big" id="quota">—</div><div class="bar"><i id="qbar"></i></div><div class="sub">Soglia di sicurezza: <b id="adaptive">—</b></div></div>
- <div class="card"><h3>Oggi</h3><div class="big" id="today">0</div><div class="sub">post pubblicati · nazionali <b id="nat">0</b></div></div>
+ <div class="card"><h3>Oggi</h3><div class="big" id="today">0</div><div class="sub">post pubblicati · di agenzia <b id="nat">0</b></div></div>
  <div class="card"><h3>Stato pubblicazione</h3><div id="pstatus" style="font-weight:600">—</div><div class="sub" id="countdown"></div><div class="sub" id="diag"></div></div>
 
  <div class="card wide"><h3>⚡ Pubblica subito</h3>
@@ -250,7 +250,7 @@ async function refresh(){
  const u=s.quota_usage,t=s.quota_total;$('quota').textContent=(u==null||t==null)?'—':u+' / '+t;$('qbar').style.width=(u!=null&&t)?Math.min(100,u/t*100)+'%':'0';
  $('qbar').style.background=(u!=null&&t&&u/t>=.9)?'#c0392b':(u!=null&&t&&u/t>=.75)?'#f59e0b':'#2e9b67';
  $('adaptive').textContent=s.adaptive_limit==null?'in apprendimento':s.adaptive_limit;
- $('today').textContent=s.published_today||0;$('nat').textContent=(s.national_today||0)+' / '+(s.national_max||10);
+ $('today').textContent=s.published_today||0;$('nat').textContent=(s.national_today||0);
  let q=s.queue||[];$('qcount').textContent=q.length;renderQueue(q);
  let sec=s.next_publish_in||0;$('countdown').textContent=q.length&&sec>0?'Prossimo tentativo tra '+(sec>=60?Math.ceil(sec/60)+' min':sec+' s'):'';
  $('diag').textContent=s.meta_diagnostic?'Diagnostica Meta: '+s.meta_diagnostic:'';

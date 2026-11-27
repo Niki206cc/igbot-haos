@@ -4,6 +4,9 @@ services:
   igbot:
     build: .
     container_name: igbot
+    # limite di memoria: se lo supera il container si riavvia invece di saturare lo swap del Raspberry
+    mem_limit: 384m
+    memswap_limit: 512m   # RAM + swap massimi
     restart: unless-stopped
     ports:
       - "8080:8080"

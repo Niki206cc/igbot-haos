@@ -272,3 +272,71 @@ async function clearLog(){await fetch('/clear_logs',{method:'POST'});refresh()}
 document.querySelector('details').addEventListener('toggle',refresh);
 setInterval(refresh,2500);refresh();
 </script></body></html>'''
+
+
+# --- Avvio automatico dopo un riavvio del container ---------------------------
+# Il publisher partiva solo premendo "Avvia": dopo un aggiornamento dello stack
+# o un riavvio per limite di memoria il bot restava fermo e la coda (con le
+# miniature) non veniva più aggiornata. Ora ricorda se era acceso e riparte.
+import json as _json
+import os as _os
+
+AUTOSTART_PATH = "/data/autostart.json"
+
+
+def _set_autostart(on):
+    try:
+        with open(AUTOSTART_PATH, "w", encoding="utf-8") as f:
+            _json.dump({"running": bool(on)}, f)
+    except Exception as e:
+        core.log(f"⚠️ Avvio automatico: impossibile salvare lo stato ({e})")
+
+
+def _want_autostart():
+    try:
+        with open(AUTOSTART_PATH, encoding="utf-8") as f:
+            return bool(_json.load(f).get("running", True))
+    except FileNotFoundError:
+        return True  # nessuna preferenza salvata: il bot era acceso prima di questa versione
+    except Exception:
+        return True
+
+
+def _wrap_route(endpoint, flag):
+    original = core.app.view_functions.get(endpoint)
+    if not original:
+        return
+    def wrapped(*a, **kw):
+        _set_autostart(flag)
+        return original(*a, **kw)
+    core.app.view_functions[endpoint] = wrapped
+
+_wrap_route("start", True)
+_wrap_route("stop", False)
+
+
+def startup_autostart():
+    time.sleep(10)
+    try:
+        with core.store_lock:
+            core.sync_state(core.load_store())  # elenco coda completo di miniature subito dopo l'avvio
+    except Exception as e:
+        core.log(f"⚠️ Sincronizzazione iniziale coda: {e}")
+    if _os.getenv("AUTOSTART", "true").lower() in ("0", "false", "no"):
+        return
+    if not _want_autostart():
+        core.log("⏸️ Bot lasciato fermo all'avvio: era stato fermato a mano.")
+        return
+    if not str(core.load_config().get("meta_access_token") or ""):
+        core.log("⏸️ Avvio automatico saltato: token Meta non configurato.")
+        return
+    if core.state.get("running") or (core.bot_thread and core.bot_thread.is_alive()):
+        return
+    core.stop_event.clear()
+    core.state["running"] = True
+    core.state["last_error"] = ""
+    core.bot_thread = threading.Thread(target=core.loop, daemon=True)
+    core.bot_thread.start()
+    core.log("▶️ Bot avviato automaticamente dopo il riavvio del container.")
+
+threading.Thread(target=startup_autostart, daemon=True).start()
